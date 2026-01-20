@@ -4,7 +4,6 @@ PostgreSQL로 유저/작업/정산 관리
 """
 
 from flask import Flask, jsonify, request
-from flask_socketio import SocketIO, emit
 from flask_cors import CORS
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -16,7 +15,15 @@ import secrets
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-secret-key')
 CORS(app, origins="*")
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
+
+# 더미 socketio (WebSocket 비활성화)
+class DummySocketIO:
+    def emit(self, *args, **kwargs): pass
+    def on(self, *args, **kwargs):
+        def decorator(f): return f
+        return decorator
+socketio = DummySocketIO()
+def emit(*args, **kwargs): pass
 
 # ==================== DB 연결 ====================
 DATABASE_URL = os.environ.get('DATABASE_URL')
@@ -573,8 +580,6 @@ def handle_join(data):
     """유저가 자신의 room에 참가"""
     user_id = data.get('user_id')
     if user_id:
-        from flask_socketio import join_room
-        join_room(user_id)
         print(f"👤 {user_id} joined room")
 
 
@@ -1037,4 +1042,4 @@ if __name__ == '__main__':
         
     port = int(os.environ.get('PORT', 5001))
     print(f"🌐 서버: http://localhost:{port}")
-    socketio.run(app, host='0.0.0.0', port=port, debug=False, allow_unsafe_werkzeug=True)
+    app.run(host='0.0.0.0', port=port, debug=False)

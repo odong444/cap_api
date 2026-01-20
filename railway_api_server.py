@@ -3,10 +3,7 @@
 PostgreSQL로 유저/작업/정산 관리
 """
 
-import eventlet
-eventlet.monkey_patch()
-
-from flask import Flask, render_template, jsonify, request
+from flask import Flask, jsonify, request
 from flask_socketio import SocketIO, emit
 from flask_cors import CORS
 import psycopg2
@@ -19,7 +16,7 @@ import secrets
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-secret-key')
 CORS(app, origins="*")
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
 # ==================== DB 연결 ====================
 DATABASE_URL = os.environ.get('DATABASE_URL')
@@ -1040,4 +1037,4 @@ if __name__ == '__main__':
         
     port = int(os.environ.get('PORT', 5001))
     print(f"🌐 서버: http://localhost:{port}")
-    socketio.run(app, host='0.0.0.0', port=port, debug=False)
+    socketio.run(app, host='0.0.0.0', port=port, debug=False, allow_unsafe_werkzeug=True)

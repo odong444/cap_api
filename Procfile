@@ -1,1 +1,1 @@
-web: gunicorn --worker-class gevent -w 1 --bind 0.0.0.0:$PORT railway_api_server:app
+web: python railway_api_server.py

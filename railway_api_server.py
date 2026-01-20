@@ -1,4 +1,12 @@
-from flask import Flask, jsonify, request
+"""
+캡챠 풀이 API 서버 - Railway 배포용
+PostgreSQL로 유저/작업/정산 관리
+"""
+
+import eventlet
+eventlet.monkey_patch()
+
+from flask import Flask, render_template, jsonify, request
 from flask_socketio import SocketIO, emit
 from flask_cors import CORS
 import psycopg2
@@ -11,7 +19,7 @@ import secrets
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-secret-key')
 CORS(app, origins="*")
-socketio = SocketIO(app, cors_allowed_origins="*")
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
 
 # ==================== DB 연결 ====================
 DATABASE_URL = os.environ.get('DATABASE_URL')

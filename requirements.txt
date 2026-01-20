@@ -3,5 +3,5 @@ flask-socketio
 flask-cors
 psycopg2-binary
 gunicorn
-eventlet
-python-socketio
+gevent
+gevent-websocket

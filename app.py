@@ -1,7 +1,5 @@
 """
-캡챠 풀이 API 서버 v2
-- 작업자별 세션 관리
-- Worker ↔ 작업자 중계
+캡챠 API 서버 - Polling 방식 (WebSocket 제거)
 """
 
 from flask import Flask, jsonify, request
@@ -11,14 +9,12 @@ from psycopg.rows import dict_row
 import os
 from datetime import datetime, timedelta
 import hashlib
-import secrets
 
 app = Flask(__name__)
 CORS(app, origins="*")
 
 DATABASE_URL = os.environ.get('DATABASE_URL')
 ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', 'admin1234')
-SESSION_TIMEOUT = 300  # 5분
 
 
 def get_db():
@@ -29,7 +25,6 @@ def init_db():
     conn = get_db()
     cur = conn.cursor()
     
-    # 유저
     cur.execute('''
         CREATE TABLE IF NOT EXISTS users (
             id SERIAL PRIMARY KEY,
@@ -41,20 +36,8 @@ def init_db():
         )
     ''')
     
-    # 키워드
     cur.execute('''
-        CREATE TABLE IF NOT EXISTS keywords (
-            id SERIAL PRIMARY KEY,
-            keyword VARCHAR(100) NOT NULL,
-            is_active BOOLEAN DEFAULT TRUE,
-            priority INTEGER DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    # UID 목록 (수집된 스토어)
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS uids (
+        CREATE TABLE IF NOT EXISTS uid_queue (
             id SERIAL PRIMARY KEY,
             uid VARCHAR(100) UNIQUE NOT NULL,
             store_name VARCHAR(200),
@@ -65,26 +48,10 @@ def init_db():
         )
     ''')
     
-    # 작업자 세션
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS sessions (
-            id SERIAL PRIMARY KEY,
-            session_id VARCHAR(100) UNIQUE NOT NULL,
-            user_id VARCHAR(50) NOT NULL,
-            status VARCHAR(20) DEFAULT 'waiting',
-            current_uid_id INTEGER,
-            screenshot_base64 TEXT,
-            user_answer VARCHAR(100),
-            last_activity TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    # 수집 결과
     cur.execute('''
         CREATE TABLE IF NOT EXISTS results (
             id SERIAL PRIMARY KEY,
-            uid VARCHAR(100),
+            uid_id INTEGER,
             store_name VARCHAR(200),
             seller_name VARCHAR(200),
             business_number VARCHAR(50),
@@ -100,7 +67,6 @@ def init_db():
         )
     ''')
     
-    # 리워드 히스토리
     cur.execute('''
         CREATE TABLE IF NOT EXISTS rewards_history (
             id SERIAL PRIMARY KEY,
@@ -111,7 +77,6 @@ def init_db():
         )
     ''')
     
-    # 출금
     cur.execute('''
         CREATE TABLE IF NOT EXISTS withdrawals (
             id SERIAL PRIMARY KEY,
@@ -125,6 +90,31 @@ def init_db():
         )
     ''')
     
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS keywords (
+            id SERIAL PRIMARY KEY,
+            keyword VARCHAR(100) NOT NULL,
+            is_active BOOLEAN DEFAULT TRUE,
+            priority INTEGER DEFAULT 0,
+            max_count INTEGER DEFAULT 100,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # 작업 세션 (작업자 상태 관리)
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS work_sessions (
+            id SERIAL PRIMARY KEY,
+            user_id VARCHAR(50) UNIQUE NOT NULL,
+            current_uid_id INTEGER,
+            screenshot TEXT,
+            answer VARCHAR(100),
+            message VARCHAR(200),
+            last_activity TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
     conn.commit()
     cur.close()
     conn.close()
@@ -132,38 +122,11 @@ def init_db():
 
 
 # ==================== 유저 API ====================
-@app.route('/api/register', methods=['POST'])
-def register():
-    data = request.json
-    user_id = data.get('user_id', '').strip()
-    password = data.get('password', '')
-    
-    if not user_id or not password:
-        return jsonify({'success': False, 'message': '아이디/비밀번호 필요'})
-    
-    pw_hash = hashlib.sha256(password.encode()).hexdigest()
-    
-    conn = get_db()
-    cur = conn.cursor()
-    
-    try:
-        cur.execute('SELECT id FROM users WHERE user_id = %s', (user_id,))
-        if cur.fetchone():
-            return jsonify({'success': False, 'message': '이미 존재하는 아이디'})
-        
-        cur.execute('INSERT INTO users (user_id, password_hash) VALUES (%s, %s)', (user_id, pw_hash))
-        conn.commit()
-        return jsonify({'success': True})
-    finally:
-        cur.close()
-        conn.close()
-
-
 @app.route('/api/login', methods=['POST'])
 def login():
     data = request.json
-    user_id = data.get('user_id', '').strip()
-    password = data.get('password', '')
+    user_id = data.get('user_id')
+    password = data.get('password')
     
     if not user_id or not password:
         return jsonify({'success': False, 'message': '아이디/비밀번호 필요'})
@@ -178,20 +141,14 @@ def login():
         user = cur.fetchone()
         
         if not user:
-            # 자동 가입
             cur.execute('INSERT INTO users (user_id, password_hash) VALUES (%s, %s)', (user_id, pw_hash))
             conn.commit()
             return jsonify({'success': True, 'user_id': user_id, 'rewards': 0, 'solved_count': 0})
         
         if user['password_hash'] != pw_hash:
-            return jsonify({'success': False, 'message': '비밀번호 불일치'})
+            return jsonify({'success': False, 'message': '비밀번호 오류'})
         
-        return jsonify({
-            'success': True,
-            'user_id': user['user_id'],
-            'rewards': user['rewards'],
-            'solved_count': user['solved_count']
-        })
+        return jsonify({'success': True, 'user_id': user_id, 'rewards': user['rewards'], 'solved_count': user['solved_count']})
     finally:
         cur.close()
         conn.close()
@@ -201,117 +158,97 @@ def login():
 def get_user(user_id):
     conn = get_db()
     cur = conn.cursor()
-    
     try:
         cur.execute('SELECT user_id, rewards, solved_count FROM users WHERE user_id = %s', (user_id,))
         user = cur.fetchone()
-        if not user:
-            return jsonify({'success': False})
-        return jsonify({'success': True, 'user': dict(user)})
+        if user:
+            return jsonify({'success': True, 'user': dict(user)})
+        return jsonify({'success': False})
     finally:
         cur.close()
         conn.close()
 
 
-# ==================== 작업자 세션 API ====================
+# ==================== 작업 세션 API ====================
 @app.route('/api/session/start', methods=['POST'])
 def start_session():
-    """작업자가 작업 시작 요청"""
+    """작업자가 작업 시작"""
     data = request.json
     user_id = data.get('user_id')
     
-    if not user_id:
-        return jsonify({'success': False, 'message': '로그인 필요'})
-    
-    session_id = secrets.token_hex(16)
-    
     conn = get_db()
     cur = conn.cursor()
-    
     try:
-        # 기존 세션 정리
-        cur.execute("DELETE FROM sessions WHERE user_id = %s", (user_id,))
-        
-        # 새 세션 생성
         cur.execute('''
-            INSERT INTO sessions (session_id, user_id, status)
-            VALUES (%s, %s, 'waiting')
-        ''', (session_id, user_id))
+            INSERT INTO work_sessions (user_id, last_activity)
+            VALUES (%s, %s)
+            ON CONFLICT (user_id) DO UPDATE SET last_activity = %s, answer = NULL
+        ''', (user_id, datetime.now(), datetime.now()))
         conn.commit()
-        
-        return jsonify({'success': True, 'session_id': session_id})
+        return jsonify({'success': True})
     finally:
         cur.close()
         conn.close()
 
 
-@app.route('/api/session/<session_id>/status')
-def get_session_status(session_id):
-    """작업자가 현재 세션 상태 확인 (폴링)"""
+@app.route('/api/session/end', methods=['POST'])
+def end_session():
+    """작업자가 작업 종료"""
+    data = request.json
+    user_id = data.get('user_id')
+    
     conn = get_db()
     cur = conn.cursor()
-    
     try:
-        cur.execute('SELECT * FROM sessions WHERE session_id = %s', (session_id,))
+        cur.execute('DELETE FROM work_sessions WHERE user_id = %s', (user_id,))
+        conn.commit()
+        return jsonify({'success': True})
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.route('/api/session/submit-answer', methods=['POST'])
+def submit_answer():
+    """작업자가 답변 제출"""
+    data = request.json
+    user_id = data.get('user_id')
+    answer = data.get('answer')
+    
+    conn = get_db()
+    cur = conn.cursor()
+    try:
+        cur.execute('UPDATE work_sessions SET answer = %s, last_activity = %s WHERE user_id = %s',
+                   (answer, datetime.now(), user_id))
+        conn.commit()
+        return jsonify({'success': True})
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.route('/api/session/poll/<user_id>')
+def poll_session(user_id):
+    """작업자가 현재 상태 폴링"""
+    conn = get_db()
+    cur = conn.cursor()
+    try:
+        cur.execute('SELECT screenshot, message, current_uid_id FROM work_sessions WHERE user_id = %s', (user_id,))
         session = cur.fetchone()
         
         if not session:
             return jsonify({'success': False, 'message': '세션 없음'})
         
-        # 타임아웃 체크
-        if session['last_activity']:
-            elapsed = (datetime.now() - session['last_activity']).total_seconds()
-            if elapsed > SESSION_TIMEOUT:
-                cur.execute("UPDATE sessions SET status = 'timeout' WHERE session_id = %s", (session_id,))
-                conn.commit()
-                return jsonify({'success': False, 'message': '세션 타임아웃', 'timeout': True})
+        # 활동 시간 갱신
+        cur.execute('UPDATE work_sessions SET last_activity = %s WHERE user_id = %s', (datetime.now(), user_id))
+        conn.commit()
         
         return jsonify({
             'success': True,
-            'status': session['status'],
-            'screenshot': session['screenshot_base64'] if session['status'] == 'captcha' else None
+            'screenshot': session['screenshot'],
+            'message': session['message'],
+            'uid_id': session['current_uid_id']
         })
-    finally:
-        cur.close()
-        conn.close()
-
-
-@app.route('/api/session/<session_id>/answer', methods=['POST'])
-def submit_answer(session_id):
-    """작업자가 캡챠 답변 제출"""
-    data = request.json
-    answer = data.get('answer', '').strip()
-    
-    if not answer:
-        return jsonify({'success': False, 'message': '답변 필요'})
-    
-    conn = get_db()
-    cur = conn.cursor()
-    
-    try:
-        cur.execute('''
-            UPDATE sessions 
-            SET user_answer = %s, status = 'answered', last_activity = %s
-            WHERE session_id = %s
-        ''', (answer, datetime.now(), session_id))
-        conn.commit()
-        
-        return jsonify({'success': True})
-    finally:
-        cur.close()
-        conn.close()
-
-
-@app.route('/api/session/<session_id>/end', methods=['POST'])
-def end_session(session_id):
-    """작업자가 작업 종료"""
-    conn = get_db()
-    cur = conn.cursor()
-    
-    try:
-        cur.execute("UPDATE sessions SET status = 'ended' WHERE session_id = %s", (session_id,))
-        conn.commit()
-        return jsonify({'success': True})
     finally:
         cur.close()
         conn.close()
@@ -319,101 +256,38 @@ def end_session(session_id):
 
 # ==================== Worker API ====================
 @app.route('/api/worker/active-sessions')
-def get_active_sessions():
-    """Worker가 활성 세션 목록 조회"""
+def active_sessions():
+    """Worker: 활성 세션 목록"""
     conn = get_db()
     cur = conn.cursor()
-    
     try:
-        # waiting 또는 answered 상태인 세션
+        # 5분 이내 활동한 세션만
         cur.execute('''
-            SELECT session_id, user_id, status, current_uid_id, user_answer, last_activity
-            FROM sessions 
-            WHERE status IN ('waiting', 'captcha', 'answered')
-            ORDER BY created_at ASC
-        ''')
+            SELECT user_id, current_uid_id, last_activity 
+            FROM work_sessions 
+            WHERE last_activity > %s
+        ''', (datetime.now() - timedelta(minutes=5),))
         sessions = cur.fetchall()
-        
-        # 타임아웃 체크
-        result = []
-        now = datetime.now()
-        for s in sessions:
-            if s['last_activity']:
-                elapsed = (now - s['last_activity']).total_seconds()
-                if elapsed > SESSION_TIMEOUT:
-                    cur.execute("UPDATE sessions SET status = 'timeout' WHERE session_id = %s", (s['session_id'],))
-                    continue
-            result.append(dict(s))
-        
-        conn.commit()
-        return jsonify({'success': True, 'sessions': result})
+        return jsonify({'success': True, 'sessions': [dict(s) for s in sessions]})
     finally:
         cur.close()
         conn.close()
 
 
-@app.route('/api/worker/session/<session_id>/assign-uid', methods=['POST'])
-def assign_uid(session_id):
-    """Worker가 세션에 UID 할당"""
-    data = request.json
-    uid_id = data.get('uid_id')
-    
+@app.route('/api/worker/check-answer/<user_id>')
+def check_answer(user_id):
+    """Worker: 답변 확인"""
     conn = get_db()
     cur = conn.cursor()
-    
     try:
-        cur.execute('''
-            UPDATE sessions SET current_uid_id = %s, status = 'working', last_activity = %s
-            WHERE session_id = %s
-        ''', (uid_id, datetime.now(), session_id))
+        cur.execute('SELECT answer FROM work_sessions WHERE user_id = %s AND answer IS NOT NULL', (user_id,))
+        row = cur.fetchone()
         
-        cur.execute("UPDATE uids SET status = 'processing' WHERE id = %s", (uid_id,))
-        conn.commit()
-        
-        return jsonify({'success': True})
-    finally:
-        cur.close()
-        conn.close()
-
-
-@app.route('/api/worker/session/<session_id>/screenshot', methods=['POST'])
-def upload_screenshot(session_id):
-    """Worker가 스크린샷 업로드"""
-    data = request.json
-    screenshot = data.get('screenshot')
-    
-    conn = get_db()
-    cur = conn.cursor()
-    
-    try:
-        cur.execute('''
-            UPDATE sessions 
-            SET screenshot_base64 = %s, status = 'captcha', user_answer = NULL, last_activity = %s
-            WHERE session_id = %s
-        ''', (screenshot, datetime.now(), session_id))
-        conn.commit()
-        
-        return jsonify({'success': True})
-    finally:
-        cur.close()
-        conn.close()
-
-
-@app.route('/api/worker/session/<session_id>/get-answer')
-def get_answer(session_id):
-    """Worker가 답변 확인"""
-    conn = get_db()
-    cur = conn.cursor()
-    
-    try:
-        cur.execute('SELECT user_answer, status FROM sessions WHERE session_id = %s', (session_id,))
-        session = cur.fetchone()
-        
-        if not session:
-            return jsonify({'success': False})
-        
-        if session['status'] == 'answered' and session['user_answer']:
-            return jsonify({'success': True, 'answer': session['user_answer']})
+        if row:
+            # 답변 가져왔으면 비우기
+            cur.execute('UPDATE work_sessions SET answer = NULL WHERE user_id = %s', (user_id,))
+            conn.commit()
+            return jsonify({'success': True, 'answer': row['answer']})
         
         return jsonify({'success': True, 'answer': None})
     finally:
@@ -421,52 +295,128 @@ def get_answer(session_id):
         conn.close()
 
 
-@app.route('/api/worker/session/<session_id>/complete', methods=['POST'])
-def complete_captcha(session_id):
-    """Worker가 캡챠 성공 처리 - 결과 저장 + 리워드 지급"""
+@app.route('/api/worker/update-screenshot', methods=['POST'])
+def update_screenshot():
+    """Worker: 스크린샷 업데이트"""
     data = request.json
-    seller_info = data.get('seller_info', {})
+    user_id = data.get('user_id')
+    screenshot = data.get('screenshot')
+    uid_id = data.get('uid_id')
+    message = data.get('message', '')
     
     conn = get_db()
     cur = conn.cursor()
-    
     try:
-        cur.execute('SELECT * FROM sessions WHERE session_id = %s', (session_id,))
-        session = cur.fetchone()
-        
-        if not session:
-            return jsonify({'success': False})
-        
-        # 결과 저장
         cur.execute('''
-            INSERT INTO results (uid, store_name, seller_name, business_number, 
+            UPDATE work_sessions 
+            SET screenshot = %s, current_uid_id = %s, message = %s, answer = NULL
+            WHERE user_id = %s
+        ''', (screenshot, uid_id, message, user_id))
+        conn.commit()
+        return jsonify({'success': True})
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.route('/api/worker/session-timeout', methods=['POST'])
+def session_timeout():
+    """Worker: 세션 타임아웃"""
+    data = request.json
+    user_id = data.get('user_id')
+    
+    conn = get_db()
+    cur = conn.cursor()
+    try:
+        cur.execute('UPDATE work_sessions SET message = %s WHERE user_id = %s',
+                   ('5분간 응답 없어 작업 종료됨', user_id))
+        conn.commit()
+        return jsonify({'success': True})
+    finally:
+        cur.close()
+        conn.close()
+
+
+# ==================== UID API ====================
+@app.route('/api/worker/add-uids', methods=['POST'])
+def add_uids():
+    """UID 추가"""
+    data = request.json
+    uids = data.get('uids', [])
+    
+    conn = get_db()
+    cur = conn.cursor()
+    try:
+        added = 0
+        for u in uids:
+            try:
+                cur.execute('''
+                    INSERT INTO uid_queue (uid, store_name, store_url, keyword)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (uid) DO NOTHING
+                ''', (u['uid'], u.get('store_name'), u.get('store_url'), u.get('keyword')))
+                added += cur.rowcount
+            except:
+                pass
+        conn.commit()
+        return jsonify({'success': True, 'added': added})
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.route('/api/worker/get-pending-uid')
+def get_pending_uid():
+    """대기 중인 UID 가져오기"""
+    conn = get_db()
+    cur = conn.cursor()
+    try:
+        cur.execute('''
+            UPDATE uid_queue SET status = 'processing'
+            WHERE id = (
+                SELECT id FROM uid_queue WHERE status = 'pending'
+                ORDER BY created_at LIMIT 1
+                FOR UPDATE SKIP LOCKED
+            )
+            RETURNING *
+        ''')
+        uid = cur.fetchone()
+        conn.commit()
+        
+        if uid:
+            return jsonify({'success': True, 'uid': dict(uid)})
+        return jsonify({'success': False, 'message': '대기 중인 UID 없음'})
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.route('/api/worker/complete-uid', methods=['POST'])
+def complete_uid():
+    """UID 완료 + 결과 저장"""
+    data = request.json
+    uid_id = data.get('uid_id')
+    user_id = data.get('user_id')
+    info = data.get('seller_info', {})
+    
+    conn = get_db()
+    cur = conn.cursor()
+    try:
+        cur.execute('''
+            INSERT INTO results (uid_id, store_name, seller_name, business_number,
                                representative, phone, email, address, store_url, solved_by)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ''', (
-            seller_info.get('uid'), seller_info.get('store_name'), seller_info.get('seller_name'),
-            seller_info.get('business_number'), seller_info.get('representative'),
-            seller_info.get('phone'), seller_info.get('email'),
-            seller_info.get('address'), seller_info.get('store_url'), session['user_id']
-        ))
+        ''', (uid_id, info.get('store_name'), info.get('seller_name'),
+              info.get('business_number'), info.get('representative'),
+              info.get('phone'), info.get('email'), info.get('address'),
+              info.get('store_url'), user_id))
         
-        # UID 완료 처리
-        if session['current_uid_id']:
-            cur.execute("UPDATE uids SET status = 'completed' WHERE id = %s", (session['current_uid_id'],))
+        cur.execute('UPDATE uid_queue SET status = %s WHERE id = %s', ('completed', uid_id))
         
-        # 리워드 지급
         reward = 100
-        cur.execute('UPDATE users SET rewards = rewards + %s, solved_count = solved_count + 1 WHERE user_id = %s',
-                   (reward, session['user_id']))
-        cur.execute('INSERT INTO rewards_history (user_id, amount, reason) VALUES (%s, %s, %s)',
-                   (session['user_id'], reward, '캡챠 해결'))
-        
-        # 세션 초기화 (다음 UID 대기)
-        cur.execute('''
-            UPDATE sessions 
-            SET current_uid_id = NULL, screenshot_base64 = NULL, user_answer = NULL, 
-                status = 'waiting', last_activity = %s
-            WHERE session_id = %s
-        ''', (datetime.now(), session_id))
+        if user_id:
+            cur.execute('UPDATE users SET rewards = rewards + %s, solved_count = solved_count + 1 WHERE user_id = %s', (reward, user_id))
+            cur.execute('INSERT INTO rewards_history (user_id, amount, reason) VALUES (%s, %s, %s)', (user_id, reward, '캡챠 해결'))
         
         conn.commit()
         return jsonify({'success': True, 'reward': reward})
@@ -475,69 +425,18 @@ def complete_captcha(session_id):
         conn.close()
 
 
-@app.route('/api/worker/session/<session_id>/fail', methods=['POST'])
-def fail_captcha(session_id):
-    """Worker가 캡챠 실패 처리 - 새로고침 후 다시 스크린샷"""
-    conn = get_db()
-    cur = conn.cursor()
-    
-    try:
-        cur.execute('''
-            UPDATE sessions 
-            SET user_answer = NULL, status = 'working', last_activity = %s
-            WHERE session_id = %s
-        ''', (datetime.now(), session_id))
-        conn.commit()
-        
-        return jsonify({'success': True})
-    finally:
-        cur.close()
-        conn.close()
-
-
-# ==================== UID 관리 API ====================
-@app.route('/api/worker/add-uid', methods=['POST'])
-def add_uid():
-    """Worker가 UID 추가"""
+@app.route('/api/worker/release-uid', methods=['POST'])
+def release_uid():
+    """UID 반환"""
     data = request.json
+    uid_id = data.get('uid_id')
     
     conn = get_db()
     cur = conn.cursor()
-    
     try:
-        cur.execute('SELECT id FROM uids WHERE uid = %s', (data.get('uid'),))
-        if cur.fetchone():
-            return jsonify({'success': False, 'message': '이미 존재'})
-        
-        cur.execute('''
-            INSERT INTO uids (uid, store_name, store_url, keyword)
-            VALUES (%s, %s, %s, %s) RETURNING id
-        ''', (data.get('uid'), data.get('store_name'), data.get('store_url'), data.get('keyword')))
-        
-        uid_id = cur.fetchone()['id']
+        cur.execute('UPDATE uid_queue SET status = %s WHERE id = %s', ('pending', uid_id))
         conn.commit()
-        
-        return jsonify({'success': True, 'uid_id': uid_id})
-    finally:
-        cur.close()
-        conn.close()
-
-
-@app.route('/api/worker/pending-uids')
-def get_pending_uids():
-    """Worker가 처리 안된 UID 목록 조회"""
-    limit = request.args.get('limit', 10, type=int)
-    
-    conn = get_db()
-    cur = conn.cursor()
-    
-    try:
-        cur.execute('''
-            SELECT * FROM uids WHERE status = 'pending'
-            ORDER BY created_at ASC LIMIT %s
-        ''', (limit,))
-        
-        return jsonify({'success': True, 'uids': [dict(u) for u in cur.fetchall()]})
+        return jsonify({'success': True})
     finally:
         cur.close()
         conn.close()
@@ -548,7 +447,6 @@ def get_pending_uids():
 def get_keywords():
     conn = get_db()
     cur = conn.cursor()
-    
     try:
         cur.execute('SELECT * FROM keywords WHERE is_active = TRUE ORDER BY priority DESC')
         return jsonify({'success': True, 'keywords': [dict(k) for k in cur.fetchall()]})
@@ -560,8 +458,7 @@ def get_keywords():
 # ==================== 어드민 API ====================
 @app.route('/api/admin/login', methods=['POST'])
 def admin_login():
-    data = request.json
-    if data.get('password') == ADMIN_PASSWORD:
+    if request.json.get('password') == ADMIN_PASSWORD:
         return jsonify({'success': True})
     return jsonify({'success': False})
 
@@ -570,95 +467,19 @@ def admin_login():
 def admin_stats():
     conn = get_db()
     cur = conn.cursor()
-    
     try:
         stats = {}
-        cur.execute('SELECT COUNT(*) as cnt FROM users')
-        stats['total_users'] = cur.fetchone()['cnt']
-        
-        cur.execute('SELECT COUNT(*) as cnt FROM results')
-        stats['total_results'] = cur.fetchone()['cnt']
-        
-        cur.execute('SELECT COUNT(*) as cnt FROM results WHERE used = FALSE')
-        stats['unused_results'] = cur.fetchone()['cnt']
-        
-        cur.execute("SELECT COUNT(*) as cnt FROM uids WHERE status = 'pending'")
-        stats['pending_uids'] = cur.fetchone()['cnt']
-        
-        cur.execute("SELECT COUNT(*) as cnt FROM sessions WHERE status IN ('waiting', 'captcha', 'answered')")
-        stats['active_sessions'] = cur.fetchone()['cnt']
-        
-        cur.execute("SELECT COUNT(*) as cnt FROM results WHERE DATE(created_at) = CURRENT_DATE")
-        stats['today_results'] = cur.fetchone()['cnt']
-        
+        cur.execute('SELECT COUNT(*) as c FROM users')
+        stats['total_users'] = cur.fetchone()['c']
+        cur.execute('SELECT COUNT(*) as c FROM results')
+        stats['total_results'] = cur.fetchone()['c']
+        cur.execute("SELECT COUNT(*) as c FROM uid_queue WHERE status = 'pending'")
+        stats['pending_uids'] = cur.fetchone()['c']
+        cur.execute("SELECT COUNT(*) as c FROM work_sessions WHERE last_activity > %s", (datetime.now() - timedelta(minutes=5),))
+        stats['active_sessions'] = cur.fetchone()['c']
+        cur.execute("SELECT COUNT(*) as c FROM results WHERE DATE(created_at) = CURRENT_DATE")
+        stats['today_results'] = cur.fetchone()['c']
         return jsonify({'success': True, 'stats': stats})
-    finally:
-        cur.close()
-        conn.close()
-
-
-@app.route('/api/admin/keywords')
-def admin_keywords():
-    conn = get_db()
-    cur = conn.cursor()
-    
-    try:
-        cur.execute('SELECT * FROM keywords ORDER BY priority DESC, created_at ASC')
-        return jsonify({'success': True, 'keywords': [dict(k) for k in cur.fetchall()]})
-    finally:
-        cur.close()
-        conn.close()
-
-
-@app.route('/api/admin/keywords', methods=['POST'])
-def add_keyword():
-    data = request.json
-    keyword = data.get('keyword', '').strip()
-    
-    if not keyword:
-        return jsonify({'success': False, 'message': '키워드 필요'})
-    
-    conn = get_db()
-    cur = conn.cursor()
-    
-    try:
-        cur.execute('INSERT INTO keywords (keyword, priority) VALUES (%s, %s) RETURNING id',
-                   (keyword, data.get('priority', 0)))
-        keyword_id = cur.fetchone()['id']
-        conn.commit()
-        return jsonify({'success': True, 'id': keyword_id})
-    finally:
-        cur.close()
-        conn.close()
-
-
-@app.route('/api/admin/keywords/<int:keyword_id>', methods=['PUT'])
-def update_keyword(keyword_id):
-    data = request.json
-    
-    conn = get_db()
-    cur = conn.cursor()
-    
-    try:
-        for field in ['keyword', 'is_active', 'priority']:
-            if field in data:
-                cur.execute(f'UPDATE keywords SET {field} = %s WHERE id = %s', (data[field], keyword_id))
-        conn.commit()
-        return jsonify({'success': True})
-    finally:
-        cur.close()
-        conn.close()
-
-
-@app.route('/api/admin/keywords/<int:keyword_id>', methods=['DELETE'])
-def delete_keyword(keyword_id):
-    conn = get_db()
-    cur = conn.cursor()
-    
-    try:
-        cur.execute('DELETE FROM keywords WHERE id = %s', (keyword_id,))
-        conn.commit()
-        return jsonify({'success': True})
     finally:
         cur.close()
         conn.close()
@@ -666,35 +487,34 @@ def delete_keyword(keyword_id):
 
 @app.route('/api/admin/results')
 def admin_results():
-    page = request.args.get('page', 1, type=int)
-    per_page = 50
+    page = int(request.args.get('page', 1))
     used = request.args.get('used', '')
     search = request.args.get('search', '')
     
     conn = get_db()
     cur = conn.cursor()
-    
     try:
-        conditions = []
+        where = []
         params = []
-        
         if used == 'true':
-            conditions.append('used = TRUE')
+            where.append('used = TRUE')
         elif used == 'false':
-            conditions.append('used = FALSE')
-        
+            where.append('used = FALSE')
         if search:
-            conditions.append('(store_name ILIKE %s OR business_number ILIKE %s)')
+            where.append('(store_name ILIKE %s OR business_number ILIKE %s)')
             params.extend([f'%{search}%', f'%{search}%'])
         
-        where = 'WHERE ' + ' AND '.join(conditions) if conditions else ''
+        sql = 'SELECT * FROM results'
+        if where:
+            sql += ' WHERE ' + ' AND '.join(where)
+        sql += ' ORDER BY created_at DESC LIMIT 50 OFFSET %s'
+        params.append((page-1)*50)
         
-        cur.execute(f'SELECT * FROM results {where} ORDER BY created_at DESC LIMIT %s OFFSET %s',
-                   params + [per_page, (page - 1) * per_page])
+        cur.execute(sql, params)
         results = cur.fetchall()
         
-        cur.execute(f'SELECT COUNT(*) as cnt FROM results {where}', params or None)
-        total = cur.fetchone()['cnt']
+        cur.execute('SELECT COUNT(*) as c FROM results')
+        total = cur.fetchone()['c']
         
         return jsonify({'success': True, 'results': [dict(r) for r in results], 'total': total})
     finally:
@@ -702,18 +522,30 @@ def admin_results():
         conn.close()
 
 
-@app.route('/api/admin/results/<int:result_id>/update', methods=['POST'])
-def update_result(result_id):
+@app.route('/api/admin/results/<int:rid>/update', methods=['POST'])
+def update_result(rid):
     data = request.json
-    
     conn = get_db()
     cur = conn.cursor()
-    
     try:
         if 'used' in data:
-            cur.execute('UPDATE results SET used = %s WHERE id = %s', (data['used'], result_id))
+            cur.execute('UPDATE results SET used = %s WHERE id = %s', (data['used'], rid))
         if 'memo' in data:
-            cur.execute('UPDATE results SET memo = %s WHERE id = %s', (data['memo'], result_id))
+            cur.execute('UPDATE results SET memo = %s WHERE id = %s', (data['memo'], rid))
+        conn.commit()
+        return jsonify({'success': True})
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.route('/api/admin/results/bulk-update', methods=['POST'])
+def bulk_update():
+    data = request.json
+    conn = get_db()
+    cur = conn.cursor()
+    try:
+        cur.execute('UPDATE results SET used = %s WHERE id = ANY(%s)', (data['used'], data['ids']))
         conn.commit()
         return jsonify({'success': True})
     finally:
@@ -725,7 +557,6 @@ def update_result(result_id):
 def export_results():
     conn = get_db()
     cur = conn.cursor()
-    
     try:
         cur.execute('SELECT * FROM results ORDER BY created_at DESC')
         return jsonify({'success': True, 'results': [dict(r) for r in cur.fetchall()]})
@@ -738,9 +569,8 @@ def export_results():
 def admin_users():
     conn = get_db()
     cur = conn.cursor()
-    
     try:
-        cur.execute('SELECT user_id, rewards, solved_count, created_at FROM users ORDER BY created_at DESC')
+        cur.execute('SELECT * FROM users ORDER BY created_at DESC')
         return jsonify({'success': True, 'users': [dict(u) for u in cur.fetchall()]})
     finally:
         cur.close()
@@ -750,16 +580,12 @@ def admin_users():
 @app.route('/api/admin/users/<user_id>/adjust-rewards', methods=['POST'])
 def adjust_rewards(user_id):
     data = request.json
-    amount = data.get('amount', 0)
-    reason = data.get('reason', '관리자 조정')
-    
     conn = get_db()
     cur = conn.cursor()
-    
     try:
-        cur.execute('UPDATE users SET rewards = rewards + %s WHERE user_id = %s', (amount, user_id))
+        cur.execute('UPDATE users SET rewards = rewards + %s WHERE user_id = %s', (data['amount'], user_id))
         cur.execute('INSERT INTO rewards_history (user_id, amount, reason) VALUES (%s, %s, %s)',
-                   (user_id, amount, reason))
+                   (user_id, data['amount'], data.get('reason', '관리자 조정')))
         conn.commit()
         return jsonify({'success': True})
     finally:
@@ -770,10 +596,8 @@ def adjust_rewards(user_id):
 @app.route('/api/admin/withdrawals')
 def admin_withdrawals():
     status = request.args.get('status', 'pending')
-    
     conn = get_db()
     cur = conn.cursor()
-    
     try:
         cur.execute('SELECT * FROM withdrawals WHERE status = %s ORDER BY created_at DESC', (status,))
         return jsonify({'success': True, 'withdrawals': [dict(w) for w in cur.fetchall()]})
@@ -789,18 +613,17 @@ def process_withdrawal(wid):
     
     conn = get_db()
     cur = conn.cursor()
-    
     try:
         cur.execute('SELECT * FROM withdrawals WHERE id = %s', (wid,))
         w = cur.fetchone()
         
         if action == 'approve':
-            cur.execute("UPDATE withdrawals SET status = 'completed' WHERE id = %s", (wid,))
+            cur.execute('UPDATE withdrawals SET status = %s WHERE id = %s', ('completed', wid))
         elif action == 'reject':
             cur.execute('UPDATE users SET rewards = rewards + %s WHERE user_id = %s', (w['amount'], w['user_id']))
             cur.execute('INSERT INTO rewards_history (user_id, amount, reason) VALUES (%s, %s, %s)',
                        (w['user_id'], w['amount'], '출금 거절 환불'))
-            cur.execute("UPDATE withdrawals SET status = 'rejected' WHERE id = %s", (wid,))
+            cur.execute('UPDATE withdrawals SET status = %s WHERE id = %s', ('rejected', wid))
         
         conn.commit()
         return jsonify({'success': True})
@@ -809,7 +632,62 @@ def process_withdrawal(wid):
         conn.close()
 
 
-# ==================== 출금 API ====================
+@app.route('/api/admin/keywords')
+def admin_keywords():
+    conn = get_db()
+    cur = conn.cursor()
+    try:
+        cur.execute('SELECT * FROM keywords ORDER BY priority DESC')
+        return jsonify({'success': True, 'keywords': [dict(k) for k in cur.fetchall()]})
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.route('/api/admin/keywords', methods=['POST'])
+def add_keyword():
+    data = request.json
+    conn = get_db()
+    cur = conn.cursor()
+    try:
+        cur.execute('INSERT INTO keywords (keyword, priority, max_count) VALUES (%s, %s, %s) RETURNING id',
+                   (data['keyword'], data.get('priority', 0), data.get('max_count', 100)))
+        conn.commit()
+        return jsonify({'success': True, 'id': cur.fetchone()['id']})
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.route('/api/admin/keywords/<int:kid>', methods=['PUT'])
+def update_keyword(kid):
+    data = request.json
+    conn = get_db()
+    cur = conn.cursor()
+    try:
+        for f in ['keyword', 'is_active', 'priority', 'max_count']:
+            if f in data:
+                cur.execute(f'UPDATE keywords SET {f} = %s WHERE id = %s', (data[f], kid))
+        conn.commit()
+        return jsonify({'success': True})
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.route('/api/admin/keywords/<int:kid>', methods=['DELETE'])
+def delete_keyword(kid):
+    conn = get_db()
+    cur = conn.cursor()
+    try:
+        cur.execute('DELETE FROM keywords WHERE id = %s', (kid,))
+        conn.commit()
+        return jsonify({'success': True})
+    finally:
+        cur.close()
+        conn.close()
+
+
 @app.route('/api/withdraw', methods=['POST'])
 def withdraw():
     data = request.json
@@ -821,38 +699,18 @@ def withdraw():
     
     conn = get_db()
     cur = conn.cursor()
-    
     try:
         cur.execute('SELECT rewards FROM users WHERE user_id = %s', (user_id,))
         user = cur.fetchone()
-        
         if not user or user['rewards'] < amount:
             return jsonify({'success': False, 'message': '잔액 부족'})
         
-        cur.execute('''
-            INSERT INTO withdrawals (user_id, amount, bank_name, account_number, account_holder)
-            VALUES (%s, %s, %s, %s, %s)
-        ''', (user_id, amount, data.get('bank_name'), data.get('account_number'), data.get('account_holder')))
-        
+        cur.execute('INSERT INTO withdrawals (user_id, amount, bank_name, account_number, account_holder) VALUES (%s, %s, %s, %s, %s)',
+                   (user_id, amount, data.get('bank_name'), data.get('account_number'), data.get('account_holder')))
         cur.execute('UPDATE users SET rewards = rewards - %s WHERE user_id = %s', (amount, user_id))
-        cur.execute('INSERT INTO rewards_history (user_id, amount, reason) VALUES (%s, %s, %s)',
-                   (user_id, -amount, '출금 요청'))
-        
+        cur.execute('INSERT INTO rewards_history (user_id, amount, reason) VALUES (%s, %s, %s)', (user_id, -amount, '출금 요청'))
         conn.commit()
         return jsonify({'success': True})
-    finally:
-        cur.close()
-        conn.close()
-
-
-@app.route('/api/rewards/history/<user_id>')
-def rewards_history(user_id):
-    conn = get_db()
-    cur = conn.cursor()
-    
-    try:
-        cur.execute('SELECT * FROM rewards_history WHERE user_id = %s ORDER BY created_at DESC LIMIT 50', (user_id,))
-        return jsonify({'success': True, 'history': [dict(h) for h in cur.fetchall()]})
     finally:
         cur.close()
         conn.close()
@@ -861,21 +719,18 @@ def rewards_history(user_id):
 # ==================== 상태 ====================
 @app.route('/')
 def index():
-    return jsonify({'status': 'ok', 'message': '캡챠 API 서버 v2'})
+    return jsonify({'status': 'ok', 'message': '캡챠 API 서버 v2 polling'})
 
 
 @app.route('/api/status')
 def status():
     conn = get_db()
     cur = conn.cursor()
-    
     try:
-        cur.execute("SELECT COUNT(*) as cnt FROM uids WHERE status = 'pending'")
-        pending = cur.fetchone()['cnt']
-        
-        cur.execute("SELECT COUNT(*) as cnt FROM sessions WHERE status IN ('waiting', 'captcha', 'answered')")
-        active = cur.fetchone()['cnt']
-        
+        cur.execute("SELECT COUNT(*) as c FROM uid_queue WHERE status = 'pending'")
+        pending = cur.fetchone()['c']
+        cur.execute("SELECT COUNT(*) as c FROM work_sessions WHERE last_activity > %s", (datetime.now() - timedelta(minutes=5),))
+        active = cur.fetchone()['c']
         return jsonify({'success': True, 'pending_uids': pending, 'active_sessions': active})
     finally:
         cur.close()

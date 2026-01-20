@@ -117,6 +117,16 @@ def init_db():
         )
     ''')
     
+    # 마이그레이션: keywords 테이블에 새 컬럼 추가
+    try:
+        cur.execute('ALTER TABLE keywords ADD COLUMN IF NOT EXISTS collected_count INTEGER DEFAULT 0')
+    except:
+        pass
+    try:
+        cur.execute('ALTER TABLE keywords ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT \'pending\'')
+    except:
+        pass
+    
     conn.commit()
     cur.close()
     conn.close()

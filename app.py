@@ -1,866 +1,656 @@
-"""
-캡챠 API 서버 - Polling 방식 (WebSocket 제거)
-"""
-
-from flask import Flask, jsonify, request
-from flask_cors import CORS
-import psycopg
-from psycopg.rows import dict_row
-import os
-from datetime import datetime, timedelta
-import hashlib
-
-app = Flask(__name__)
-CORS(app, origins="*")
-
-DATABASE_URL = os.environ.get('DATABASE_URL')
-ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', 'admin1234')
-
-
-def get_db():
-    return psycopg.connect(DATABASE_URL, row_factory=dict_row)
-
-
-def init_db():
-    conn = get_db()
-    cur = conn.cursor()
-    
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            id SERIAL PRIMARY KEY,
-            user_id VARCHAR(50) UNIQUE NOT NULL,
-            password_hash VARCHAR(128) NOT NULL,
-            rewards INTEGER DEFAULT 0,
-            solved_count INTEGER DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS uid_queue (
-            id SERIAL PRIMARY KEY,
-            uid VARCHAR(100) UNIQUE NOT NULL,
-            store_name VARCHAR(200),
-            store_url VARCHAR(500),
-            keyword VARCHAR(100),
-            status VARCHAR(20) DEFAULT 'pending',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS results (
-            id SERIAL PRIMARY KEY,
-            task_id INTEGER,
-            store_name VARCHAR(200),
-            seller_name VARCHAR(200),
-            business_number VARCHAR(50),
-            representative VARCHAR(100),
-            phone VARCHAR(50),
-            email VARCHAR(100),
-            address TEXT,
-            store_url VARCHAR(500),
-            solved_by VARCHAR(50),
-            used BOOLEAN DEFAULT FALSE,
-            memo TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS rewards_history (
-            id SERIAL PRIMARY KEY,
-            user_id VARCHAR(50) NOT NULL,
-            amount INTEGER NOT NULL,
-            reason VARCHAR(200),
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS withdrawals (
-            id SERIAL PRIMARY KEY,
-            user_id VARCHAR(50) NOT NULL,
-            amount INTEGER NOT NULL,
-            bank_name VARCHAR(50),
-            account_number VARCHAR(50),
-            account_holder VARCHAR(50),
-            status VARCHAR(20) DEFAULT 'pending',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS keywords (
-            id SERIAL PRIMARY KEY,
-            keyword VARCHAR(100) NOT NULL,
-            is_active BOOLEAN DEFAULT TRUE,
-            priority INTEGER DEFAULT 0,
-            max_count INTEGER DEFAULT 100,
-            collected_count INTEGER DEFAULT 0,
-            status VARCHAR(20) DEFAULT 'pending',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    # 작업 세션 (작업자 상태 관리)
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS work_sessions (
-            id SERIAL PRIMARY KEY,
-            user_id VARCHAR(50) UNIQUE NOT NULL,
-            current_uid_id INTEGER,
-            screenshot TEXT,
-            answer VARCHAR(100),
-            message VARCHAR(200),
-            last_activity TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    conn.commit()
-    cur.close()
-    conn.close()
-    print("✅ DB 초기화 완료")
-
-
-# ==================== 유저 API ====================
-@app.route('/api/login', methods=['POST'])
-def login():
-    data = request.json
-    user_id = data.get('user_id')
-    password = data.get('password')
-    
-    if not user_id or not password:
-        return jsonify({'success': False, 'message': '아이디/비밀번호 필요'})
-    
-    pw_hash = hashlib.sha256(password.encode()).hexdigest()
-    
-    conn = get_db()
-    cur = conn.cursor()
-    
-    try:
-        cur.execute('SELECT * FROM users WHERE user_id = %s', (user_id,))
-        user = cur.fetchone()
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>캡챠 풀이 - 포인트 적립</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+        }
+        .container {
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            width: 100%;
+            max-width: 600px;
+            overflow: hidden;
+        }
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 12px;
+            text-align: center;
+        }
+        .header h1 { font-size: 18px; margin-bottom: 3px; }
+        .header p { opacity: 0.9; font-size: 12px; }
         
-        if not user:
-            cur.execute('INSERT INTO users (user_id, password_hash) VALUES (%s, %s)', (user_id, pw_hash))
-            conn.commit()
-            return jsonify({'success': True, 'user_id': user_id, 'rewards': 0, 'solved_count': 0})
+        .content { padding: 15px; }
         
-        if user['password_hash'] != pw_hash:
-            return jsonify({'success': False, 'message': '비밀번호 오류'})
+        /* 로그인 폼 */
+        .login-form input {
+            width: 100%;
+            padding: 15px;
+            border: 2px solid #e0e0e0;
+            border-radius: 10px;
+            font-size: 16px;
+            margin-bottom: 15px;
+            transition: border-color 0.3s;
+        }
+        .login-form input:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        .btn {
+            width: 100%;
+            padding: 12px;
+            border: none;
+            border-radius: 10px;
+            font-size: 14px;
+            font-weight: bold;
+            cursor: pointer;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+        .btn:active { transform: scale(0.98); }
+        .btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+        .btn-primary {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }
+        .btn-success {
+            background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%);
+            color: white;
+        }
+        .btn-danger {
+            background: #e74c3c;
+            color: white;
+        }
+        .btn-secondary {
+            background: #95a5a6;
+            color: white;
+        }
         
-        return jsonify({'success': True, 'user_id': user_id, 'rewards': user['rewards'], 'solved_count': user['solved_count']})
-    finally:
-        cur.close()
-        conn.close()
-
-
-@app.route('/api/user/<user_id>')
-def get_user(user_id):
-    conn = get_db()
-    cur = conn.cursor()
-    try:
-        cur.execute('SELECT user_id, rewards, solved_count FROM users WHERE user_id = %s', (user_id,))
-        user = cur.fetchone()
-        if user:
-            return jsonify({'success': True, 'user': dict(user)})
-        return jsonify({'success': False})
-    finally:
-        cur.close()
-        conn.close()
-
-
-# ==================== 작업 세션 API ====================
-@app.route('/api/session/start', methods=['POST'])
-def start_session():
-    """작업자가 작업 시작"""
-    data = request.json
-    user_id = data.get('user_id')
-    
-    conn = get_db()
-    cur = conn.cursor()
-    try:
-        cur.execute('''
-            INSERT INTO work_sessions (user_id, last_activity)
-            VALUES (%s, %s)
-            ON CONFLICT (user_id) DO UPDATE SET last_activity = %s, answer = NULL
-        ''', (user_id, datetime.now(), datetime.now()))
-        conn.commit()
-        return jsonify({'success': True})
-    finally:
-        cur.close()
-        conn.close()
-
-
-@app.route('/api/session/end', methods=['POST'])
-def end_session():
-    """작업자가 작업 종료"""
-    data = request.json
-    user_id = data.get('user_id')
-    
-    conn = get_db()
-    cur = conn.cursor()
-    try:
-        cur.execute('DELETE FROM work_sessions WHERE user_id = %s', (user_id,))
-        conn.commit()
-        return jsonify({'success': True})
-    finally:
-        cur.close()
-        conn.close()
-
-
-@app.route('/api/session/submit-answer', methods=['POST'])
-def submit_answer():
-    """작업자가 답변 제출"""
-    data = request.json
-    user_id = data.get('user_id')
-    answer = data.get('answer')
-    
-    conn = get_db()
-    cur = conn.cursor()
-    try:
-        cur.execute('UPDATE work_sessions SET answer = %s, last_activity = %s WHERE user_id = %s',
-                   (answer, datetime.now(), user_id))
-        conn.commit()
-        return jsonify({'success': True})
-    finally:
-        cur.close()
-        conn.close()
-
-
-@app.route('/api/session/poll/<user_id>')
-def poll_session(user_id):
-    """작업자가 현재 상태 폴링"""
-    conn = get_db()
-    cur = conn.cursor()
-    try:
-        cur.execute('SELECT screenshot, message, current_uid_id FROM work_sessions WHERE user_id = %s', (user_id,))
-        session = cur.fetchone()
+        /* 대시보드 */
+        .dashboard { display: none; }
+        .stats {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px;
+            margin-bottom: 10px;
+        }
+        .stat-card {
+            background: #f8f9fa;
+            padding: 8px;
+            border-radius: 8px;
+            text-align: center;
+        }
+        .stat-card .value {
+            font-size: 18px;
+            font-weight: bold;
+            color: #667eea;
+        }
+        .stat-card .label {
+            color: #666;
+            font-size: 11px;
+        }
         
-        if not session:
-            return jsonify({'success': False, 'message': '세션 없음'})
+        /* 질문 표시 */
+        .question-box {
+            background: #fff3cd;
+            border: 2px solid #ffc107;
+            border-radius: 10px;
+            padding: 12px;
+            margin-bottom: 10px;
+            text-align: center;
+            font-size: 16px;
+            font-weight: bold;
+            color: #856404;
+        }
         
-        # 활동 시간 갱신
-        cur.execute('UPDATE work_sessions SET last_activity = %s WHERE user_id = %s', (datetime.now(), user_id))
-        conn.commit()
+        /* 작업 영역 */
+        .work-area {
+            display: none;
+            margin-top: 10px;
+        }
+        .screenshot-container {
+            background: #f0f0f0;
+            border-radius: 12px;
+            padding: 8px;
+            margin-bottom: 10px;
+            min-height: 250px;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            overflow: auto;
+            position: relative;
+        }
+        .screenshot-container img {
+            max-width: 100%;
+            min-width: 100%;
+            border-radius: 8px;
+        }
         
-        return jsonify({
-            'success': True,
-            'screenshot': session['screenshot'],
-            'message': session['message'],
-            'uid_id': session['current_uid_id']
-        })
-    finally:
-        cur.close()
-        conn.close()
-
-
-# ==================== Worker API ====================
-@app.route('/api/worker/active-sessions')
-def active_sessions():
-    """Worker: 활성 세션 목록"""
-    conn = get_db()
-    cur = conn.cursor()
-    try:
-        # 5분 이내 활동한 세션만
-        cur.execute('''
-            SELECT user_id, current_uid_id, last_activity 
-            FROM work_sessions 
-            WHERE last_activity > %s
-        ''', (datetime.now() - timedelta(minutes=5),))
-        sessions = cur.fetchall()
-        return jsonify({'success': True, 'sessions': [dict(s) for s in sessions]})
-    finally:
-        cur.close()
-        conn.close()
-
-
-@app.route('/api/worker/check-answer/<user_id>')
-def check_answer(user_id):
-    """Worker: 답변 확인"""
-    conn = get_db()
-    cur = conn.cursor()
-    try:
-        cur.execute('SELECT answer FROM work_sessions WHERE user_id = %s AND answer IS NOT NULL', (user_id,))
-        row = cur.fetchone()
+        /* 결과 오버레이 */
+        .result-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            display: none;
+            justify-content: center;
+            align-items: center;
+            border-radius: 12px;
+            font-size: 32px;
+            font-weight: bold;
+            z-index: 10;
+            flex-direction: column;
+            gap: 10px;
+        }
+        .result-overlay.show {
+            display: flex;
+        }
+        .result-overlay.correct {
+            background: rgba(39, 174, 96, 0.9);
+            color: white;
+        }
+        .result-overlay.wrong {
+            background: rgba(231, 76, 60, 0.9);
+            color: white;
+        }
+        .result-overlay.loading {
+            background: rgba(0, 0, 0, 0.75);
+            color: white;
+            font-size: 18px;
+        }
         
-        if row:
-            # 답변 가져왔으면 비우기
-            cur.execute('UPDATE work_sessions SET answer = NULL WHERE user_id = %s', (user_id,))
-            conn.commit()
-            return jsonify({'success': True, 'answer': row['answer']})
+        /* 로딩 스피너 */
+        .spinner {
+            width: 40px;
+            height: 40px;
+            border: 4px solid rgba(255,255,255,0.3);
+            border-top-color: white;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
         
-        return jsonify({'success': True, 'answer': None})
-    finally:
-        cur.close()
-        conn.close()
-
-
-@app.route('/api/worker/update-screenshot', methods=['POST'])
-def update_screenshot():
-    """Worker: 스크린샷 업데이트"""
-    data = request.json
-    user_id = data.get('user_id')
-    screenshot = data.get('screenshot')
-    uid_id = data.get('uid_id')
-    message = data.get('message', '')
-    
-    conn = get_db()
-    cur = conn.cursor()
-    try:
-        cur.execute('''
-            UPDATE work_sessions 
-            SET screenshot = %s, current_uid_id = %s, message = %s, answer = NULL
-            WHERE user_id = %s
-        ''', (screenshot, uid_id, message, user_id))
-        conn.commit()
-        return jsonify({'success': True})
-    finally:
-        cur.close()
-        conn.close()
-
-
-@app.route('/api/worker/session-timeout', methods=['POST'])
-def session_timeout():
-    """Worker: 세션 타임아웃"""
-    data = request.json
-    user_id = data.get('user_id')
-    
-    conn = get_db()
-    cur = conn.cursor()
-    try:
-        cur.execute('UPDATE work_sessions SET message = %s WHERE user_id = %s',
-                   ('5분간 응답 없어 작업 종료됨', user_id))
-        conn.commit()
-        return jsonify({'success': True})
-    finally:
-        cur.close()
-        conn.close()
-
-
-# ==================== UID API ====================
-@app.route('/api/worker/add-uids', methods=['POST'])
-def add_uids():
-    """UID 추가"""
-    data = request.json
-    uids = data.get('uids', [])
-    
-    conn = get_db()
-    cur = conn.cursor()
-    try:
-        added = 0
-        for u in uids:
-            try:
-                cur.execute('''
-                    INSERT INTO uid_queue (uid, store_name, store_url, keyword)
-                    VALUES (%s, %s, %s, %s)
-                    ON CONFLICT (uid) DO NOTHING
-                ''', (u['uid'], u.get('store_name'), u.get('store_url'), u.get('keyword')))
-                added += cur.rowcount
-            except:
-                pass
-        conn.commit()
-        return jsonify({'success': True, 'added': added})
-    finally:
-        cur.close()
-        conn.close()
-
-
-@app.route('/api/worker/get-pending-uid')
-def get_pending_uid():
-    """대기 중인 UID 가져오기"""
-    conn = get_db()
-    cur = conn.cursor()
-    try:
-        cur.execute('''
-            UPDATE uid_queue SET status = 'processing'
-            WHERE id = (
-                SELECT id FROM uid_queue WHERE status = 'pending'
-                ORDER BY created_at LIMIT 1
-                FOR UPDATE SKIP LOCKED
-            )
-            RETURNING *
-        ''')
-        uid = cur.fetchone()
-        conn.commit()
+        .hidden { display: none !important; }
+        .answer-form {
+            display: flex;
+            gap: 10px;
+        }
+        .answer-form input {
+            flex: 1;
+            padding: 15px;
+            border: 2px solid #e0e0e0;
+            border-radius: 10px;
+            font-size: 18px;
+            text-align: center;
+            letter-spacing: 3px;
+        }
+        .answer-form input:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        .answer-form input:disabled {
+            background: #f0f0f0;
+            cursor: not-allowed;
+        }
+        .answer-form button {
+            padding: 15px 25px;
+        }
         
-        if uid:
-            return jsonify({'success': True, 'uid': dict(uid)})
-        return jsonify({'success': False, 'message': '대기 중인 UID 없음'})
-    finally:
-        cur.close()
-        conn.close()
-
-
-@app.route('/api/worker/complete-uid', methods=['POST'])
-def complete_uid():
-    """UID 완료 + 결과 저장"""
-    data = request.json
-    uid_id = data.get('uid_id')
-    user_id = data.get('user_id')
-    info = data.get('seller_info', {})
-    
-    conn = get_db()
-    cur = conn.cursor()
-    try:
-        cur.execute('''
-            INSERT INTO results (task_id, store_name, seller_name, business_number,
-                               representative, phone, email, address, store_url, solved_by)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ''', (uid_id, info.get('store_name'), info.get('seller_name'),
-              info.get('business_number'), info.get('representative'),
-              info.get('phone'), info.get('email'), info.get('address'),
-              info.get('store_url'), user_id))
+        /* 상태 표시 */
+        .status {
+            text-align: center;
+            padding: 8px;
+            color: #666;
+            font-size: 13px;
+        }
+        .status.waiting { color: #f39c12; }
+        .status.working { color: #3498db; }
+        .status.success { color: #27ae60; }
+        .status.error { color: #e74c3c; }
         
-        cur.execute('UPDATE uid_queue SET status = %s WHERE id = %s', ('completed', uid_id))
+        /* 메시지 */
+        .message {
+            padding: 15px;
+            border-radius: 10px;
+            margin-bottom: 15px;
+            text-align: center;
+            display: none;
+        }
+        .message.success { background: #d4edda; color: #155724; }
+        .message.error { background: #f8d7da; color: #721c24; }
+        .message.info { background: #e7f1ff; color: #004085; }
         
-        reward = 100
-        if user_id:
-            cur.execute('UPDATE users SET rewards = rewards + %s, solved_count = solved_count + 1 WHERE user_id = %s', (reward, user_id))
-            cur.execute('INSERT INTO rewards_history (user_id, amount, reason) VALUES (%s, %s, %s)', (user_id, reward, '캡챠 해결'))
+        .hidden { display: none !important; }
         
-        conn.commit()
-        return jsonify({'success': True, 'reward': reward})
-    except Exception as e:
-        print(f"complete_uid 오류: {e}")
-        conn.rollback()
-        return jsonify({'success': False, 'error': str(e)})
-    finally:
-        cur.close()
-        conn.close()
-
-
-@app.route('/api/worker/release-uid', methods=['POST'])
-def release_uid():
-    """UID 반환"""
-    data = request.json
-    uid_id = data.get('uid_id')
-    
-    conn = get_db()
-    cur = conn.cursor()
-    try:
-        cur.execute('UPDATE uid_queue SET status = %s WHERE id = %s', ('pending', uid_id))
-        conn.commit()
-        return jsonify({'success': True})
-    finally:
-        cur.close()
-        conn.close()
-
-
-# ==================== 키워드 API ====================
-@app.route('/api/keywords')
-def get_keywords():
-    conn = get_db()
-    cur = conn.cursor()
-    try:
-        cur.execute('SELECT * FROM keywords WHERE is_active = TRUE ORDER BY priority DESC')
-        return jsonify({'success': True, 'keywords': [dict(k) for k in cur.fetchall()]})
-    finally:
-        cur.close()
-        conn.close()
-
-
-# ==================== 어드민 API ====================
-@app.route('/api/admin/login', methods=['POST'])
-def admin_login():
-    if request.json.get('password') == ADMIN_PASSWORD:
-        return jsonify({'success': True})
-    return jsonify({'success': False})
-
-
-@app.route('/api/admin/stats')
-def admin_stats():
-    conn = get_db()
-    cur = conn.cursor()
-    try:
-        stats = {}
-        cur.execute('SELECT COUNT(*) as c FROM users')
-        stats['total_users'] = cur.fetchone()['c']
-        cur.execute('SELECT COUNT(*) as c FROM results')
-        stats['total_results'] = cur.fetchone()['c']
-        cur.execute("SELECT COUNT(*) as c FROM uid_queue WHERE status = 'pending'")
-        stats['pending_uids'] = cur.fetchone()['c']
-        cur.execute("SELECT COUNT(*) as c FROM work_sessions WHERE last_activity > %s", (datetime.now() - timedelta(minutes=5),))
-        stats['active_sessions'] = cur.fetchone()['c']
-        cur.execute("SELECT COUNT(*) as c FROM results WHERE DATE(created_at) = CURRENT_DATE")
-        stats['today_results'] = cur.fetchone()['c']
-        return jsonify({'success': True, 'stats': stats})
-    finally:
-        cur.close()
-        conn.close()
-
-
-@app.route('/api/admin/results')
-def admin_results():
-    page = int(request.args.get('page', 1))
-    used = request.args.get('used', '')
-    search = request.args.get('search', '')
-    
-    conn = get_db()
-    cur = conn.cursor()
-    try:
-        where = []
-        params = []
-        if used == 'true':
-            where.append('used = TRUE')
-        elif used == 'false':
-            where.append('used = FALSE')
-        if search:
-            where.append('(store_name ILIKE %s OR business_number ILIKE %s)')
-            params.extend([f'%{search}%', f'%{search}%'])
+        /* 로딩 */
+        .loading {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border: 3px solid rgba(102,126,234,.3);
+            border-radius: 50%;
+            border-top-color: #667eea;
+            animation: spin 1s ease-in-out infinite;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
         
-        sql = 'SELECT * FROM results'
-        if where:
-            sql += ' WHERE ' + ' AND '.join(where)
-        sql += ' ORDER BY created_at DESC LIMIT 50 OFFSET %s'
-        params.append((page-1)*50)
+        /* TTS 버튼 */
+        .tts-btn {
+            background: none;
+            border: none;
+            font-size: 24px;
+            cursor: pointer;
+            padding: 10px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>💰 캡챠 풀이</h1>
+            <p>문자를 입력하고 포인트를 적립하세요!</p>
+        </div>
         
-        cur.execute(sql, params)
-        results = cur.fetchall()
+        <div class="content">
+            <div id="message" class="message"></div>
+            
+            <!-- 로그인 -->
+            <div id="login-section" class="login-form">
+                <input type="text" id="user-id" placeholder="아이디">
+                <input type="password" id="password" placeholder="비밀번호">
+                <button class="btn btn-primary" onclick="login()">로그인 / 자동가입</button>
+            </div>
+            
+            <!-- 대시보드 -->
+            <div id="dashboard" class="dashboard">
+                <div class="stats">
+                    <div class="stat-card">
+                        <div class="value" id="rewards">0</div>
+                        <div class="label">보유 포인트</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="value" id="solved">0</div>
+                        <div class="label">해결 횟수</div>
+                    </div>
+                </div>
+                
+                <button id="start-btn" class="btn btn-success" onclick="startWork()">
+                    🚀 작업 시작하기
+                </button>
+                <button id="stop-btn" class="btn btn-danger hidden" onclick="stopWork()">
+                    ⏹ 작업 종료
+                </button>
+                
+                <!-- 작업 영역 -->
+                <div id="work-area" class="work-area">
+                    <div id="status-text" class="status waiting">⏳ 작업 대기 중... (브라우저 준비 중)</div>
+                    
+                    <div id="captcha-section" class="hidden">
+                        <div id="question-box" class="question-box">
+                            영수증을 보고 질문에 답하세요
+                        </div>
+                        
+                        <div class="screenshot-container">
+                            <img id="screenshot" src="" alt="캡챠 이미지">
+                            <div id="result-overlay" class="result-overlay hidden"></div>
+                        </div>
+                        
+                        <div class="answer-form">
+                            <input type="text" id="answer-input" placeholder="정답을 입력하세요." 
+                                   onkeypress="if(event.key==='Enter')submitAnswer()">
+                            <button class="tts-btn" onclick="refreshScreenshot()" title="새로고침">🔄</button>
+                            <button class="tts-btn" onclick="speakText()" title="음성으로 듣기">🔊</button>
+                        </div>
+                        <button class="btn btn-primary" style="margin-top:10px" onclick="submitAnswer()">확인</button>
+                    </div>
+                </div>
+                
+                <button class="btn btn-secondary" style="margin-top:20px" onclick="logout()">로그아웃</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const API_SERVER = 'https://capapi-production.up.railway.app';
         
-        cur.execute('SELECT COUNT(*) as c FROM results')
-        total = cur.fetchone()['c']
+        let currentUser = null;
+        let pollInterval = null;
+        let isWorking = false;
+        let lastMessageShown = '';  // 중복 메시지 방지
+        let isWaitingResult = false;  // 답변 제출 후 결과 대기 중
+        let lastScreenshot = '';  // 이전 스크린샷 (변경 감지용)
         
-        return jsonify({'success': True, 'results': [dict(r) for r in results], 'total': total})
-    finally:
-        cur.close()
-        conn.close()
-
-
-@app.route('/api/admin/results/<int:rid>/update', methods=['POST'])
-def update_result(rid):
-    data = request.json
-    conn = get_db()
-    cur = conn.cursor()
-    try:
-        if 'used' in data:
-            cur.execute('UPDATE results SET used = %s WHERE id = %s', (data['used'], rid))
-        if 'memo' in data:
-            cur.execute('UPDATE results SET memo = %s WHERE id = %s', (data['memo'], rid))
-        conn.commit()
-        return jsonify({'success': True})
-    finally:
-        cur.close()
-        conn.close()
-
-
-@app.route('/api/admin/results/bulk-update', methods=['POST'])
-def bulk_update():
-    data = request.json
-    conn = get_db()
-    cur = conn.cursor()
-    try:
-        cur.execute('UPDATE results SET used = %s WHERE id = ANY(%s)', (data['used'], data['ids']))
-        conn.commit()
-        return jsonify({'success': True})
-    finally:
-        cur.close()
-        conn.close()
-
-
-@app.route('/api/admin/results/export')
-def export_results():
-    conn = get_db()
-    cur = conn.cursor()
-    try:
-        cur.execute('SELECT * FROM results ORDER BY created_at DESC')
-        return jsonify({'success': True, 'results': [dict(r) for r in cur.fetchall()]})
-    finally:
-        cur.close()
-        conn.close()
-
-
-@app.route('/api/admin/users')
-def admin_users():
-    conn = get_db()
-    cur = conn.cursor()
-    try:
-        cur.execute('SELECT * FROM users ORDER BY created_at DESC')
-        return jsonify({'success': True, 'users': [dict(u) for u in cur.fetchall()]})
-    finally:
-        cur.close()
-        conn.close()
-
-
-@app.route('/api/admin/users/<user_id>/adjust-rewards', methods=['POST'])
-def adjust_rewards(user_id):
-    data = request.json
-    conn = get_db()
-    cur = conn.cursor()
-    try:
-        cur.execute('UPDATE users SET rewards = rewards + %s WHERE user_id = %s', (data['amount'], user_id))
-        cur.execute('INSERT INTO rewards_history (user_id, amount, reason) VALUES (%s, %s, %s)',
-                   (user_id, data['amount'], data.get('reason', '관리자 조정')))
-        conn.commit()
-        return jsonify({'success': True})
-    finally:
-        cur.close()
-        conn.close()
-
-
-@app.route('/api/admin/withdrawals')
-def admin_withdrawals():
-    status = request.args.get('status', 'pending')
-    conn = get_db()
-    cur = conn.cursor()
-    try:
-        cur.execute('SELECT * FROM withdrawals WHERE status = %s ORDER BY created_at DESC', (status,))
-        return jsonify({'success': True, 'withdrawals': [dict(w) for w in cur.fetchall()]})
-    finally:
-        cur.close()
-        conn.close()
-
-
-@app.route('/api/admin/withdrawals/<int:wid>/process', methods=['POST'])
-def process_withdrawal(wid):
-    data = request.json
-    action = data.get('action')
-    
-    conn = get_db()
-    cur = conn.cursor()
-    try:
-        cur.execute('SELECT * FROM withdrawals WHERE id = %s', (wid,))
-        w = cur.fetchone()
+        // 로그인
+        async function login() {
+            const userId = document.getElementById('user-id').value.trim();
+            const password = document.getElementById('password').value;
+            
+            if (!userId || !password) {
+                showMessage('아이디와 비밀번호를 입력하세요', 'error');
+                return;
+            }
+            
+            try {
+                const resp = await fetch(`${API_SERVER}/api/login`, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({user_id: userId, password})
+                });
+                const data = await resp.json();
+                
+                if (data.success) {
+                    currentUser = {user_id: userId, ...data};
+                    localStorage.setItem('user', JSON.stringify(currentUser));
+                    showDashboard();
+                } else {
+                    showMessage(data.message || '로그인 실패', 'error');
+                }
+            } catch (e) {
+                showMessage('서버 연결 실패', 'error');
+            }
+        }
         
-        if action == 'approve':
-            cur.execute('UPDATE withdrawals SET status = %s WHERE id = %s', ('completed', wid))
-        elif action == 'reject':
-            cur.execute('UPDATE users SET rewards = rewards + %s WHERE user_id = %s', (w['amount'], w['user_id']))
-            cur.execute('INSERT INTO rewards_history (user_id, amount, reason) VALUES (%s, %s, %s)',
-                       (w['user_id'], w['amount'], '출금 거절 환불'))
-            cur.execute('UPDATE withdrawals SET status = %s WHERE id = %s', ('rejected', wid))
+        // 대시보드 표시
+        function showDashboard() {
+            document.getElementById('login-section').classList.add('hidden');
+            document.getElementById('dashboard').style.display = 'block';
+            updateStats();
+        }
         
-        conn.commit()
-        return jsonify({'success': True})
-    finally:
-        cur.close()
-        conn.close()
-
-
-@app.route('/api/admin/keywords')
-def admin_keywords():
-    conn = get_db()
-    cur = conn.cursor()
-    try:
-        cur.execute('SELECT * FROM keywords ORDER BY priority DESC')
-        return jsonify({'success': True, 'keywords': [dict(k) for k in cur.fetchall()]})
-    finally:
-        cur.close()
-        conn.close()
-
-
-@app.route('/api/admin/keywords', methods=['POST'])
-def add_keyword():
-    data = request.json
-    conn = get_db()
-    cur = conn.cursor()
-    try:
-        cur.execute('INSERT INTO keywords (keyword, priority, max_count) VALUES (%s, %s, %s) RETURNING id',
-                   (data['keyword'], data.get('priority', 0), data.get('max_count', 100)))
-        conn.commit()
-        return jsonify({'success': True, 'id': cur.fetchone()['id']})
-    finally:
-        cur.close()
-        conn.close()
-
-
-@app.route('/api/admin/keywords/<int:kid>', methods=['PUT'])
-def update_keyword(kid):
-    data = request.json
-    conn = get_db()
-    cur = conn.cursor()
-    try:
-        for f in ['keyword', 'is_active', 'priority', 'max_count']:
-            if f in data:
-                cur.execute(f'UPDATE keywords SET {f} = %s WHERE id = %s', (data[f], kid))
-        conn.commit()
-        return jsonify({'success': True})
-    finally:
-        cur.close()
-        conn.close()
-
-
-@app.route('/api/admin/keywords/<int:kid>', methods=['DELETE'])
-def delete_keyword(kid):
-    conn = get_db()
-    cur = conn.cursor()
-    try:
-        cur.execute('DELETE FROM keywords WHERE id = %s', (kid,))
-        conn.commit()
-        return jsonify({'success': True})
-    finally:
-        cur.close()
-        conn.close()
-
-
-@app.route('/api/admin/keywords/bulk', methods=['POST'])
-def bulk_add_keywords():
-    """키워드 대량 등록"""
-    data = request.json
-    keywords_text = data.get('keywords', '')
-    max_count = data.get('max_count', 100)
-    
-    keywords = [k.strip() for k in keywords_text.split('\n') if k.strip()]
-    
-    conn = get_db()
-    cur = conn.cursor()
-    try:
-        added = 0
-        for kw in keywords:
-            try:
-                cur.execute('''
-                    INSERT INTO keywords (keyword, max_count, status)
-                    VALUES (%s, %s, 'pending')
-                ''', (kw, max_count))
-                added += 1
-            except:
-                pass
-        conn.commit()
-        return jsonify({'success': True, 'added': added})
-    finally:
-        cur.close()
-        conn.close()
-
-
-# ==================== Collector API ====================
-@app.route('/api/collector/pending-keyword')
-def get_pending_keyword():
-    """수집할 키워드 가져오기 (pending → collecting)"""
-    conn = get_db()
-    cur = conn.cursor()
-    try:
-        cur.execute('''
-            UPDATE keywords SET status = 'collecting'
-            WHERE id = (
-                SELECT id FROM keywords 
-                WHERE status = 'pending' AND is_active = TRUE
-                ORDER BY priority DESC, created_at ASC
-                LIMIT 1
-                FOR UPDATE SKIP LOCKED
-            )
-            RETURNING *
-        ''')
-        keyword = cur.fetchone()
-        conn.commit()
+        // 통계 업데이트
+        async function updateStats() {
+            if (!currentUser) return;
+            
+            try {
+                const resp = await fetch(`${API_SERVER}/api/user/${currentUser.user_id}`);
+                const data = await resp.json();
+                
+                if (data.success) {
+                    document.getElementById('rewards').textContent = data.user.rewards.toLocaleString();
+                    document.getElementById('solved').textContent = data.user.solved_count;
+                }
+            } catch (e) {}
+        }
         
-        if keyword:
-            return jsonify({'success': True, 'keyword': dict(keyword)})
-        return jsonify({'success': False, 'message': '대기 중인 키워드 없음'})
-    finally:
-        cur.close()
-        conn.close()
-
-
-@app.route('/api/collector/update-progress', methods=['POST'])
-def update_keyword_progress():
-    """수집 진행 상황 업데이트"""
-    data = request.json
-    keyword_id = data.get('keyword_id')
-    collected_count = data.get('collected_count', 0)
-    
-    conn = get_db()
-    cur = conn.cursor()
-    try:
-        cur.execute('UPDATE keywords SET collected_count = %s WHERE id = %s',
-                   (collected_count, keyword_id))
-        conn.commit()
-        return jsonify({'success': True})
-    finally:
-        cur.close()
-        conn.close()
-
-
-@app.route('/api/collector/complete-keyword', methods=['POST'])
-def complete_keyword():
-    """키워드 수집 완료"""
-    data = request.json
-    keyword_id = data.get('keyword_id')
-    collected_count = data.get('collected_count', 0)
-    
-    conn = get_db()
-    cur = conn.cursor()
-    try:
-        cur.execute('''
-            UPDATE keywords SET status = 'completed', collected_count = %s
-            WHERE id = %s
-        ''', (collected_count, keyword_id))
-        conn.commit()
-        return jsonify({'success': True})
-    finally:
-        cur.close()
-        conn.close()
-
-
-@app.route('/api/collector/reset-keyword/<int:kid>', methods=['POST'])
-def reset_keyword(kid):
-    """키워드 다시 수집 (pending으로 리셋)"""
-    conn = get_db()
-    cur = conn.cursor()
-    try:
-        cur.execute('''
-            UPDATE keywords SET status = 'pending', collected_count = 0
-            WHERE id = %s
-        ''', (kid,))
-        conn.commit()
-        return jsonify({'success': True})
-    finally:
-        cur.close()
-        conn.close()
-
-
-@app.route('/api/withdraw', methods=['POST'])
-def withdraw():
-    data = request.json
-    user_id = data.get('user_id')
-    amount = data.get('amount', 0)
-    
-    if amount < 10000:
-        return jsonify({'success': False, 'message': '최소 10,000P'})
-    
-    conn = get_db()
-    cur = conn.cursor()
-    try:
-        cur.execute('SELECT rewards FROM users WHERE user_id = %s', (user_id,))
-        user = cur.fetchone()
-        if not user or user['rewards'] < amount:
-            return jsonify({'success': False, 'message': '잔액 부족'})
+        // 작업 시작
+        async function startWork() {
+            if (!currentUser) return;
+            
+            try {
+                const resp = await fetch(`${API_SERVER}/api/session/start`, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({user_id: currentUser.user_id})
+                });
+                const data = await resp.json();
+                
+                if (data.success) {
+                    isWorking = true;
+                    lastMessageShown = '';
+                    isWaitingResult = false;
+                    lastScreenshot = '';
+                    
+                    document.getElementById('start-btn').classList.add('hidden');
+                    document.getElementById('stop-btn').classList.remove('hidden');
+                    document.getElementById('work-area').style.display = 'block';
+                    
+                    setStatus('waiting', '⏳ 작업 대기 중... (브라우저 준비 중)');
+                    
+                    // 폴링 시작 (2초마다)
+                    pollInterval = setInterval(pollSession, 2000);
+                    pollSession(); // 즉시 한 번 호출
+                }
+            } catch (e) {
+                showMessage('작업 시작 실패', 'error');
+            }
+        }
         
-        cur.execute('INSERT INTO withdrawals (user_id, amount, bank_name, account_number, account_holder) VALUES (%s, %s, %s, %s, %s)',
-                   (user_id, amount, data.get('bank_name'), data.get('account_number'), data.get('account_holder')))
-        cur.execute('UPDATE users SET rewards = rewards - %s WHERE user_id = %s', (amount, user_id))
-        cur.execute('INSERT INTO rewards_history (user_id, amount, reason) VALUES (%s, %s, %s)', (user_id, -amount, '출금 요청'))
-        conn.commit()
-        return jsonify({'success': True})
-    finally:
-        cur.close()
-        conn.close()
-
-
-# ==================== 상태 ====================
-@app.route('/')
-def index():
-    return jsonify({'status': 'ok', 'message': '캡챠 API 서버 v2 polling'})
-
-
-@app.route('/api/status')
-def status():
-    conn = get_db()
-    cur = conn.cursor()
-    try:
-        cur.execute("SELECT COUNT(*) as c FROM uid_queue WHERE status = 'pending'")
-        pending = cur.fetchone()['c']
-        cur.execute("SELECT COUNT(*) as c FROM work_sessions WHERE last_activity > %s", (datetime.now() - timedelta(minutes=5),))
-        active = cur.fetchone()['c']
-        return jsonify({'success': True, 'pending_uids': pending, 'active_sessions': active})
-    finally:
-        cur.close()
-        conn.close()
-
-
-if DATABASE_URL:
-    init_db()
-
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+        // 세션 상태 폴링 - 수정된 API 호출
+        async function pollSession() {
+            if (!currentUser || !isWorking) return;
+            
+            try {
+                // 올바른 API 경로: /api/session/poll/<user_id>
+                const resp = await fetch(`${API_SERVER}/api/session/poll/${currentUser.user_id}`);
+                const data = await resp.json();
+                
+                if (!data.success) {
+                    setStatus('waiting', '⏳ 세션 준비 중...');
+                    return;
+                }
+                
+                // 메시지가 있으면 처리
+                if (data.message) {
+                    if (data.message.includes('타임아웃') || data.message.includes('종료')) {
+                        showMessage(data.message, 'error');
+                        stopWork();
+                        return;
+                    }
+                }
+                
+                // 스크린샷이 있으면 처리
+                if (data.screenshot) {
+                    // 새로운 스크린샷인지 확인
+                    const isNewScreenshot = data.screenshot !== lastScreenshot;
+                    
+                    if (isWaitingResult && isNewScreenshot) {
+                        // 결과 대기 중이었고 새 스크린샷이 왔다 = 결과 처리
+                        if (data.message && data.message.includes('틀렸')) {
+                            // 틀림
+                            showResultOverlay('wrong', '❌ 틀렸습니다!');
+                            setTimeout(() => {
+                                hideResultOverlay();
+                                updateScreenshot(data);
+                                isWaitingResult = false;
+                                disableInput(false);
+                            }, 1500);
+                        } else {
+                            // 맞음 (새 문제로 넘어감)
+                            showResultOverlay('correct', '✅ 정답!');
+                            updateStats();
+                            setTimeout(() => {
+                                hideResultOverlay();
+                                updateScreenshot(data);
+                                isWaitingResult = false;
+                                disableInput(false);
+                            }, 1500);
+                        }
+                        lastScreenshot = data.screenshot;
+                    } else if (!isWaitingResult) {
+                        // 일반 상태 - 스크린샷 표시
+                        updateScreenshot(data);
+                        lastScreenshot = data.screenshot;
+                    }
+                } else {
+                    setStatus('waiting', '⏳ 다음 작업 대기 중...');
+                    document.getElementById('captcha-section').classList.add('hidden');
+                }
+                
+            } catch (e) {
+                console.error('Poll error:', e);
+            }
+        }
+        
+        // 스크린샷 업데이트 함수
+        function updateScreenshot(data) {
+            setStatus('working', '📝 캡챠를 입력하세요!');
+            document.getElementById('screenshot').src = 'data:image/png;base64,' + data.screenshot;
+            document.getElementById('captcha-section').classList.remove('hidden');
+            document.getElementById('answer-input').focus();
+            
+            // 질문 표시
+            if (data.message && !data.message.includes('틀렸') && !data.message.includes('타임아웃')) {
+                document.getElementById('question-box').textContent = data.message;
+            }
+        }
+        
+        // 결과 오버레이 표시
+        function showResultOverlay(type, text) {
+            const overlay = document.getElementById('result-overlay');
+            overlay.className = 'result-overlay show ' + type;
+            
+            if (type === 'loading') {
+                overlay.innerHTML = '<div class="spinner"></div><div>' + text + '</div>';
+            } else {
+                overlay.innerHTML = text;
+            }
+        }
+        
+        // 결과 오버레이 숨기기
+        function hideResultOverlay() {
+            const overlay = document.getElementById('result-overlay');
+            overlay.className = 'result-overlay';
+            overlay.innerHTML = '';
+        }
+        
+        // 입력 비활성화/활성화
+        function disableInput(disabled) {
+            document.getElementById('answer-input').disabled = disabled;
+            const confirmBtn = document.querySelector('#captcha-section .btn-primary');
+            if (confirmBtn) confirmBtn.disabled = disabled;
+        }
+        
+        // 답변 제출 - 수정된 API 호출
+        async function submitAnswer() {
+            const answer = document.getElementById('answer-input').value.trim();
+            
+            if (!answer) {
+                showMessage('답변을 입력하세요', 'error');
+                return;
+            }
+            
+            // 이미 대기 중이면 무시
+            if (isWaitingResult) return;
+            
+            try {
+                // 로딩 상태 표시
+                isWaitingResult = true;
+                showResultOverlay('loading', '⏳ 확인 중...');
+                disableInput(true);
+                
+                // 올바른 API 경로: /api/session/submit-answer
+                const resp = await fetch(`${API_SERVER}/api/session/submit-answer`, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        user_id: currentUser.user_id,
+                        answer: answer
+                    })
+                });
+                const data = await resp.json();
+                
+                if (data.success) {
+                    document.getElementById('answer-input').value = '';
+                    setStatus('working', '⏳ 답변 확인 중...');
+                    lastMessageShown = '';
+                    // 결과는 pollSession에서 처리
+                } else {
+                    showMessage('답변 제출 실패', 'error');
+                    isWaitingResult = false;
+                    hideResultOverlay();
+                    disableInput(false);
+                }
+            } catch (e) {
+                showMessage('답변 제출 실패', 'error');
+                isWaitingResult = false;
+                hideResultOverlay();
+                disableInput(false);
+            }
+        }
+        
+        // 스크린샷 새로고침
+        function refreshScreenshot() {
+            pollSession();
+        }
+        
+        // TTS (간단한 알림)
+        function speakText() {
+            showMessage('음성 기능은 준비 중입니다', 'info');
+        }
+        
+        // 작업 종료
+        async function stopWork() {
+            if (pollInterval) {
+                clearInterval(pollInterval);
+                pollInterval = null;
+            }
+            
+            isWorking = false;
+            isWaitingResult = false;
+            lastScreenshot = '';
+            hideResultOverlay();
+            disableInput(false);
+            
+            if (currentUser) {
+                try {
+                    await fetch(`${API_SERVER}/api/session/end`, {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({user_id: currentUser.user_id})
+                    });
+                } catch (e) {}
+            }
+            
+            document.getElementById('start-btn').classList.remove('hidden');
+            document.getElementById('stop-btn').classList.add('hidden');
+            document.getElementById('work-area').style.display = 'none';
+            document.getElementById('captcha-section').classList.add('hidden');
+            
+            updateStats();
+        }
+        
+        // 상태 표시
+        function setStatus(type, text) {
+            const el = document.getElementById('status-text');
+            el.className = 'status ' + type;
+            el.textContent = text;
+        }
+        
+        // 메시지 표시
+        function showMessage(text, type) {
+            const el = document.getElementById('message');
+            el.className = 'message ' + type;
+            el.textContent = text;
+            el.style.display = 'block';
+            
+            setTimeout(() => el.style.display = 'none', 3000);
+        }
+        
+        // 로그아웃
+        function logout() {
+            stopWork();
+            currentUser = null;
+            localStorage.removeItem('user');
+            
+            document.getElementById('login-section').classList.remove('hidden');
+            document.getElementById('dashboard').style.display = 'none';
+        }
+        
+        // 초기화
+        window.onload = function() {
+            const saved = localStorage.getItem('user');
+            if (saved) {
+                currentUser = JSON.parse(saved);
+                showDashboard();
+            }
+        };
+    </script>
+</body>
+</html>

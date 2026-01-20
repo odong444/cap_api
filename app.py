@@ -181,10 +181,16 @@ def start_session():
     conn = get_db()
     cur = conn.cursor()
     try:
+        # 세션 시작 시 이전 데이터 모두 클리어
         cur.execute('''
             INSERT INTO work_sessions (user_id, last_activity)
             VALUES (%s, %s)
-            ON CONFLICT (user_id) DO UPDATE SET last_activity = %s, answer = NULL
+            ON CONFLICT (user_id) DO UPDATE SET 
+                last_activity = %s, 
+                answer = NULL,
+                screenshot = NULL,
+                current_uid_id = NULL,
+                message = NULL
         ''', (user_id, datetime.now(), datetime.now()))
         conn.commit()
         return jsonify({'success': True})
@@ -404,11 +410,12 @@ def complete_uid():
     conn = get_db()
     cur = conn.cursor()
     try:
+        # task_id 없이 저장 (foreign key 문제 회피)
         cur.execute('''
-            INSERT INTO results (task_id, store_name, seller_name, business_number,
+            INSERT INTO results (store_name, seller_name, business_number,
                                representative, phone, email, address, store_url, solved_by)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ''', (uid_id, info.get('store_name'), info.get('seller_name'),
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ''', (info.get('store_name'), info.get('seller_name'),
               info.get('business_number'), info.get('representative'),
               info.get('phone'), info.get('email'), info.get('address'),
               info.get('store_url'), user_id))

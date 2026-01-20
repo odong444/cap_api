@@ -610,6 +610,8 @@ def admin_stats():
         stats = {}
         cur.execute('SELECT COUNT(*) as c FROM users')
         stats['total_users'] = cur.fetchone()['c']
+        cur.execute('SELECT COUNT(*) as c FROM users WHERE is_approved = FALSE')
+        stats['pending_users'] = cur.fetchone()['c']
         cur.execute('SELECT COUNT(*) as c FROM results')
         stats['total_results'] = cur.fetchone()['c']
         cur.execute("SELECT COUNT(*) as c FROM uid_queue WHERE status = 'pending'")
@@ -706,11 +708,60 @@ def export_results():
 
 @app.route('/api/admin/users')
 def admin_users():
+    filter_type = request.args.get('filter', '')  # pending, approved, or empty for all
+    
     conn = get_db()
     cur = conn.cursor()
     try:
-        cur.execute('SELECT * FROM users ORDER BY created_at DESC')
+        if filter_type == 'pending':
+            cur.execute('SELECT * FROM users WHERE is_approved = FALSE ORDER BY created_at DESC')
+        elif filter_type == 'approved':
+            cur.execute('SELECT * FROM users WHERE is_approved = TRUE ORDER BY created_at DESC')
+        else:
+            cur.execute('SELECT * FROM users ORDER BY created_at DESC')
         return jsonify({'success': True, 'users': [dict(u) for u in cur.fetchall()]})
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.route('/api/admin/users/<user_id>/approve', methods=['POST'])
+def approve_user(user_id):
+    """회원 승인"""
+    conn = get_db()
+    cur = conn.cursor()
+    try:
+        cur.execute('UPDATE users SET is_approved = TRUE WHERE user_id = %s', (user_id,))
+        conn.commit()
+        return jsonify({'success': True, 'message': '회원 승인 완료'})
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.route('/api/admin/users/<user_id>/reject', methods=['POST'])
+def reject_user(user_id):
+    """회원 거절 (삭제)"""
+    conn = get_db()
+    cur = conn.cursor()
+    try:
+        cur.execute('DELETE FROM users WHERE user_id = %s AND is_approved = FALSE', (user_id,))
+        conn.commit()
+        return jsonify({'success': True, 'message': '회원 거절 (삭제) 완료'})
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.route('/api/admin/users/<user_id>/suspend', methods=['POST'])
+def suspend_user(user_id):
+    """회원 정지"""
+    conn = get_db()
+    cur = conn.cursor()
+    try:
+        cur.execute('UPDATE users SET is_approved = FALSE WHERE user_id = %s', (user_id,))
+        conn.commit()
+        return jsonify({'success': True, 'message': '회원 정지 완료'})
     finally:
         cur.close()
         conn.close()

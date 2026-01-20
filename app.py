@@ -30,10 +30,31 @@ def init_db():
             id SERIAL PRIMARY KEY,
             user_id VARCHAR(50) UNIQUE NOT NULL,
             password_hash VARCHAR(128) NOT NULL,
+            name VARCHAR(50),
+            phone VARCHAR(20),
+            email VARCHAR(100),
+            bank_name VARCHAR(50),
+            bank_account VARCHAR(50),
+            account_holder VARCHAR(50),
             rewards INTEGER DEFAULT 0,
             solved_count INTEGER DEFAULT 0,
+            is_approved BOOLEAN DEFAULT FALSE,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
+    ''')
+    
+    # 기존 테이블에 컬럼 추가 (이미 테이블이 있을 경우)
+    cur.execute('''
+        DO $$ 
+        BEGIN
+            BEGIN ALTER TABLE users ADD COLUMN name VARCHAR(50); EXCEPTION WHEN duplicate_column THEN NULL; END;
+            BEGIN ALTER TABLE users ADD COLUMN phone VARCHAR(20); EXCEPTION WHEN duplicate_column THEN NULL; END;
+            BEGIN ALTER TABLE users ADD COLUMN email VARCHAR(100); EXCEPTION WHEN duplicate_column THEN NULL; END;
+            BEGIN ALTER TABLE users ADD COLUMN bank_name VARCHAR(50); EXCEPTION WHEN duplicate_column THEN NULL; END;
+            BEGIN ALTER TABLE users ADD COLUMN bank_account VARCHAR(50); EXCEPTION WHEN duplicate_column THEN NULL; END;
+            BEGIN ALTER TABLE users ADD COLUMN account_holder VARCHAR(50); EXCEPTION WHEN duplicate_column THEN NULL; END;
+            BEGIN ALTER TABLE users ADD COLUMN is_approved BOOLEAN DEFAULT FALSE; EXCEPTION WHEN duplicate_column THEN NULL; END;
+        END $$;
     ''')
     
     cur.execute('''
@@ -124,6 +145,89 @@ def init_db():
 
 
 # ==================== 유저 API ====================
+
+@app.route('/api/register', methods=['POST'])
+def register():
+    """회원가입"""
+    data = request.json
+    
+    # 필수 필드 검증
+    required_fields = ['user_id', 'password', 'name', 'phone', 'email', 'bank_name', 'bank_account', 'account_holder']
+    for field in required_fields:
+        if not data.get(field):
+            return jsonify({'success': False, 'message': f'{field} 필드가 필요합니다.'})
+    
+    user_id = data.get('user_id')
+    password = data.get('password')
+    password_confirm = data.get('password_confirm')
+    
+    # 비밀번호 확인
+    if password != password_confirm:
+        return jsonify({'success': False, 'message': '비밀번호가 일치하지 않습니다.'})
+    
+    # 비밀번호 길이 검증
+    if len(password) < 4:
+        return jsonify({'success': False, 'message': '비밀번호는 4자 이상이어야 합니다.'})
+    
+    pw_hash = hashlib.sha256(password.encode()).hexdigest()
+    
+    conn = get_db()
+    cur = conn.cursor()
+    
+    try:
+        # 아이디 중복 체크
+        cur.execute('SELECT user_id FROM users WHERE user_id = %s', (user_id,))
+        if cur.fetchone():
+            return jsonify({'success': False, 'message': '이미 사용 중인 아이디입니다.'})
+        
+        # 회원가입
+        cur.execute('''
+            INSERT INTO users (user_id, password_hash, name, phone, email, bank_name, bank_account, account_holder, is_approved)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, FALSE)
+        ''', (
+            user_id, 
+            pw_hash, 
+            data.get('name'),
+            data.get('phone'),
+            data.get('email'),
+            data.get('bank_name'),
+            data.get('bank_account'),
+            data.get('account_holder')
+        ))
+        conn.commit()
+        
+        return jsonify({'success': True, 'message': '회원가입이 완료되었습니다. 관리자 승인 후 이용 가능합니다.'})
+    except Exception as e:
+        return jsonify({'success': False, 'message': f'회원가입 실패: {str(e)}'})
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.route('/api/check-userid', methods=['POST'])
+def check_userid():
+    """아이디 중복 체크"""
+    data = request.json
+    user_id = data.get('user_id')
+    
+    if not user_id:
+        return jsonify({'available': False, 'message': '아이디를 입력하세요.'})
+    
+    if len(user_id) < 4:
+        return jsonify({'available': False, 'message': '아이디는 4자 이상이어야 합니다.'})
+    
+    conn = get_db()
+    cur = conn.cursor()
+    try:
+        cur.execute('SELECT user_id FROM users WHERE user_id = %s', (user_id,))
+        if cur.fetchone():
+            return jsonify({'available': False, 'message': '이미 사용 중인 아이디입니다.'})
+        return jsonify({'available': True, 'message': '사용 가능한 아이디입니다.'})
+    finally:
+        cur.close()
+        conn.close()
+
+
 @app.route('/api/login', methods=['POST'])
 def login():
     data = request.json
@@ -131,7 +235,7 @@ def login():
     password = data.get('password')
     
     if not user_id or not password:
-        return jsonify({'success': False, 'message': '아이디/비밀번호 필요'})
+        return jsonify({'success': False, 'message': '아이디/비밀번호를 입력하세요.'})
     
     pw_hash = hashlib.sha256(password.encode()).hexdigest()
     
@@ -143,14 +247,22 @@ def login():
         user = cur.fetchone()
         
         if not user:
-            cur.execute('INSERT INTO users (user_id, password_hash) VALUES (%s, %s)', (user_id, pw_hash))
-            conn.commit()
-            return jsonify({'success': True, 'user_id': user_id, 'rewards': 0, 'solved_count': 0})
+            return jsonify({'success': False, 'message': '존재하지 않는 아이디입니다.'})
         
         if user['password_hash'] != pw_hash:
-            return jsonify({'success': False, 'message': '비밀번호 오류'})
+            return jsonify({'success': False, 'message': '비밀번호가 올바르지 않습니다.'})
         
-        return jsonify({'success': True, 'user_id': user_id, 'rewards': user['rewards'], 'solved_count': user['solved_count']})
+        # 승인 여부 체크
+        if not user.get('is_approved', True):
+            return jsonify({'success': False, 'message': '관리자 승인 대기 중입니다.'})
+        
+        return jsonify({
+            'success': True, 
+            'user_id': user_id, 
+            'name': user.get('name', ''),
+            'rewards': user['rewards'], 
+            'solved_count': user['solved_count']
+        })
     finally:
         cur.close()
         conn.close()

@@ -51,7 +51,7 @@ def init_db():
     cur.execute('''
         CREATE TABLE IF NOT EXISTS results (
             id SERIAL PRIMARY KEY,
-            uid_id INTEGER,
+            task_id INTEGER,
             store_name VARCHAR(200),
             seller_name VARCHAR(200),
             business_number VARCHAR(50),
@@ -116,16 +116,6 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
-    
-    # 마이그레이션: keywords 테이블에 새 컬럼 추가
-    try:
-        cur.execute('ALTER TABLE keywords ADD COLUMN IF NOT EXISTS collected_count INTEGER DEFAULT 0')
-    except:
-        pass
-    try:
-        cur.execute('ALTER TABLE keywords ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT \'pending\'')
-    except:
-        pass
     
     conn.commit()
     cur.close()
@@ -415,7 +405,7 @@ def complete_uid():
     cur = conn.cursor()
     try:
         cur.execute('''
-            INSERT INTO results (uid_id, store_name, seller_name, business_number,
+            INSERT INTO results (task_id, store_name, seller_name, business_number,
                                representative, phone, email, address, store_url, solved_by)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ''', (uid_id, info.get('store_name'), info.get('seller_name'),
@@ -432,6 +422,10 @@ def complete_uid():
         
         conn.commit()
         return jsonify({'success': True, 'reward': reward})
+    except Exception as e:
+        print(f"complete_uid 오류: {e}")
+        conn.rollback()
+        return jsonify({'success': False, 'error': str(e)})
     finally:
         cur.close()
         conn.close()

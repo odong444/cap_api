@@ -172,6 +172,8 @@ def get_user(user_id):
 
 
 # ==================== 작업 세션 API ====================
+MAX_WORKERS = 4  # 동시 작업자 제한
+
 @app.route('/api/session/start', methods=['POST'])
 def start_session():
     """작업자가 작업 시작"""
@@ -181,6 +183,18 @@ def start_session():
     conn = get_db()
     cur = conn.cursor()
     try:
+        # 현재 활성 세션 수 체크 (자기 자신 제외)
+        cur.execute('SELECT COUNT(*) as cnt FROM work_sessions WHERE user_id != %s', (user_id,))
+        result = cur.fetchone()
+        current_count = result['cnt'] if result else 0
+        
+        if current_count >= MAX_WORKERS:
+            return jsonify({
+                'success': False, 
+                'error': 'full', 
+                'message': f'작업자가 많아 진행할 수 없습니다. (현재 {current_count}명 작업 중)'
+            })
+        
         # 세션 시작 시 이전 데이터 모두 클리어
         cur.execute('''
             INSERT INTO work_sessions (user_id, last_activity)
@@ -193,7 +207,7 @@ def start_session():
                 message = NULL
         ''', (user_id, datetime.now(), datetime.now()))
         conn.commit()
-        return jsonify({'success': True})
+        return jsonify({'success': True, 'workers': current_count + 1})
     finally:
         cur.close()
         conn.close()

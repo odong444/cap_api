@@ -97,6 +97,8 @@ def init_db():
             is_active BOOLEAN DEFAULT TRUE,
             priority INTEGER DEFAULT 0,
             max_count INTEGER DEFAULT 100,
+            collected_count INTEGER DEFAULT 0,
+            status VARCHAR(20) DEFAULT 'pending',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
@@ -681,6 +683,121 @@ def delete_keyword(kid):
     cur = conn.cursor()
     try:
         cur.execute('DELETE FROM keywords WHERE id = %s', (kid,))
+        conn.commit()
+        return jsonify({'success': True})
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.route('/api/admin/keywords/bulk', methods=['POST'])
+def bulk_add_keywords():
+    """키워드 대량 등록"""
+    data = request.json
+    keywords_text = data.get('keywords', '')
+    max_count = data.get('max_count', 100)
+    
+    keywords = [k.strip() for k in keywords_text.split('\n') if k.strip()]
+    
+    conn = get_db()
+    cur = conn.cursor()
+    try:
+        added = 0
+        for kw in keywords:
+            try:
+                cur.execute('''
+                    INSERT INTO keywords (keyword, max_count, status)
+                    VALUES (%s, %s, 'pending')
+                ''', (kw, max_count))
+                added += 1
+            except:
+                pass
+        conn.commit()
+        return jsonify({'success': True, 'added': added})
+    finally:
+        cur.close()
+        conn.close()
+
+
+# ==================== Collector API ====================
+@app.route('/api/collector/pending-keyword')
+def get_pending_keyword():
+    """수집할 키워드 가져오기 (pending → collecting)"""
+    conn = get_db()
+    cur = conn.cursor()
+    try:
+        cur.execute('''
+            UPDATE keywords SET status = 'collecting'
+            WHERE id = (
+                SELECT id FROM keywords 
+                WHERE status = 'pending' AND is_active = TRUE
+                ORDER BY priority DESC, created_at ASC
+                LIMIT 1
+                FOR UPDATE SKIP LOCKED
+            )
+            RETURNING *
+        ''')
+        keyword = cur.fetchone()
+        conn.commit()
+        
+        if keyword:
+            return jsonify({'success': True, 'keyword': dict(keyword)})
+        return jsonify({'success': False, 'message': '대기 중인 키워드 없음'})
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.route('/api/collector/update-progress', methods=['POST'])
+def update_keyword_progress():
+    """수집 진행 상황 업데이트"""
+    data = request.json
+    keyword_id = data.get('keyword_id')
+    collected_count = data.get('collected_count', 0)
+    
+    conn = get_db()
+    cur = conn.cursor()
+    try:
+        cur.execute('UPDATE keywords SET collected_count = %s WHERE id = %s',
+                   (collected_count, keyword_id))
+        conn.commit()
+        return jsonify({'success': True})
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.route('/api/collector/complete-keyword', methods=['POST'])
+def complete_keyword():
+    """키워드 수집 완료"""
+    data = request.json
+    keyword_id = data.get('keyword_id')
+    collected_count = data.get('collected_count', 0)
+    
+    conn = get_db()
+    cur = conn.cursor()
+    try:
+        cur.execute('''
+            UPDATE keywords SET status = 'completed', collected_count = %s
+            WHERE id = %s
+        ''', (collected_count, keyword_id))
+        conn.commit()
+        return jsonify({'success': True})
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.route('/api/collector/reset-keyword/<int:kid>', methods=['POST'])
+def reset_keyword(kid):
+    """키워드 다시 수집 (pending으로 리셋)"""
+    conn = get_db()
+    cur = conn.cursor()
+    try:
+        cur.execute('''
+            UPDATE keywords SET status = 'pending', collected_count = 0
+            WHERE id = %s
+        ''', (kid,))
         conn.commit()
         return jsonify({'success': True})
     finally:

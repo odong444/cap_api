@@ -38,6 +38,7 @@ def init_db():
             account_holder VARCHAR(50),
             rewards INTEGER DEFAULT 0,
             solved_count INTEGER DEFAULT 0,
+            point_per_solve INTEGER DEFAULT 10,
             is_approved BOOLEAN DEFAULT FALSE,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
@@ -54,6 +55,7 @@ def init_db():
             BEGIN ALTER TABLE users ADD COLUMN bank_account VARCHAR(50); EXCEPTION WHEN duplicate_column THEN NULL; END;
             BEGIN ALTER TABLE users ADD COLUMN account_holder VARCHAR(50); EXCEPTION WHEN duplicate_column THEN NULL; END;
             BEGIN ALTER TABLE users ADD COLUMN is_approved BOOLEAN DEFAULT FALSE; EXCEPTION WHEN duplicate_column THEN NULL; END;
+            BEGIN ALTER TABLE users ADD COLUMN point_per_solve INTEGER DEFAULT 10; EXCEPTION WHEN duplicate_column THEN NULL; END;
         END $$;
     ''')
     
@@ -548,8 +550,14 @@ def complete_uid():
         
         cur.execute('UPDATE uid_queue SET status = %s WHERE id = %s', ('completed', uid_id))
         
-        reward = 100
+        # 유저별 포인트 조회 (기본값 10)
+        reward = 10
         if user_id:
+            cur.execute('SELECT point_per_solve FROM users WHERE user_id = %s', (user_id,))
+            user_row = cur.fetchone()
+            if user_row and user_row.get('point_per_solve'):
+                reward = user_row['point_per_solve']
+            
             cur.execute('UPDATE users SET rewards = rewards + %s, solved_count = solved_count + 1 WHERE user_id = %s', (reward, user_id))
             cur.execute('INSERT INTO rewards_history (user_id, amount, reason) VALUES (%s, %s, %s)', (user_id, reward, '캡챠 해결'))
         
@@ -762,6 +770,23 @@ def suspend_user(user_id):
         cur.execute('UPDATE users SET is_approved = FALSE WHERE user_id = %s', (user_id,))
         conn.commit()
         return jsonify({'success': True, 'message': '회원 정지 완료'})
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.route('/api/admin/users/<user_id>/set-point', methods=['POST'])
+def set_user_point(user_id):
+    """유저별 포인트 설정"""
+    data = request.json
+    point = data.get('point_per_solve', 10)
+    
+    conn = get_db()
+    cur = conn.cursor()
+    try:
+        cur.execute('UPDATE users SET point_per_solve = %s WHERE user_id = %s', (point, user_id))
+        conn.commit()
+        return jsonify({'success': True, 'message': f'포인트 {point}원으로 설정됨'})
     finally:
         cur.close()
         conn.close()
